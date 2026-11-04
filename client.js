@@ -71,6 +71,8 @@ window.__ModuleLoader__.load({
         filterHint: (f) => `仅标题含「${f}」`,
         skipped: (n) => `${n} 篇取正文失败，已跳过`,
         partial: (done, total) => `正文还在载入（${done}/${total}），结果可能不全；载完后会自动重新检索。`,
+        findHeading: (n) => `模糊命中 ${n} 篇（换个说法也能找到）`,
+        findFailed: '官方模糊检索没成功：',
         // 知识库页签
         kbIntro: '选择左侧文件夹，或直接检索文件名。',
         kbEmpty: '这个知识库里没有内容。',
@@ -133,6 +135,8 @@ window.__ModuleLoader__.load({
         filterHint: (f) => `title contains “${f}” only`,
         skipped: (n) => `${n} notes failed to load and were skipped`,
         partial: (done, total) => `Text still loading (${done}/${total}); results may be incomplete and will be refreshed automatically.`,
+        findHeading: (n) => `${n} fuzzy matches (different wording can still hit)`,
+        findFailed: 'Server fuzzy search failed: ',
         kbIntro: 'Pick a folder on the left, or search file names.',
         kbEmpty: 'This space has no content.',
         kbPickKb: 'Pick a space first.',
@@ -451,6 +455,10 @@ window.__ModuleLoader__.load({
       const [searchError, setSearchError] = React.useState(null)
       const [searchPartial, setSearchPartial] = React.useState(false)
       const rerunRef = React.useRef(false)
+      /** 字面检索没命中时，自动用官方分词检索补一轮（kb_find）。 */
+      const [findResults, setFindResults] = React.useState(null)
+      const [findError, setFindError] = React.useState(null)
+      const findQRef = React.useRef('')
 
       // ── 知识库侧 ──
       const [kbs, setKbs] = React.useState(null)
@@ -626,6 +634,28 @@ window.__ModuleLoader__.load({
         openNote(current.id, 0, null)
       }, [openNote])
 
+      /** 官方分词检索（kb_find）：字面没命中时自动补一轮。 */
+      const runFind = React.useCallback(async (value) => {
+        const q = String(value || '').trim()
+        if (q === '') return
+        findQRef.current = q
+        setFindError(null)
+        try {
+          const payload = await getJson(API + '/find?q=' + encodeURIComponent(q))
+          if (findQRef.current !== q) return
+          if (payload && payload.error) {
+            setFindResults(null)
+            setFindError(payload.error)
+          } else {
+            setFindResults(payload)
+          }
+        } catch (error) {
+          if (findQRef.current !== q) return
+          setFindResults(null)
+          setFindError(describeError(error, t))
+        }
+      }, [])
+
       const runSearch = React.useCallback(async (value) => {
         const terms = splitTerms(value)
         if (terms.length === 0) {
@@ -640,6 +670,14 @@ window.__ModuleLoader__.load({
           setResults(payload)
           setSearchPartial(Boolean(payload && payload.warming))
           if (payload && payload.warm) setWarm(payload.warm)
+          const matches = payload && Array.isArray(payload.matches) ? payload.matches : []
+          if (matches.length === 0 && !(payload && payload.warming)) {
+            // 字面没命中且正文已就绪：换官方分词检索再找一次。
+            runFind(value)
+          } else {
+            setFindResults(null)
+            setFindError(null)
+          }
         } catch (error) {
           setResults(null)
           setSearchPartial(false)
@@ -647,12 +685,15 @@ window.__ModuleLoader__.load({
         } finally {
           setSearching(false)
         }
-      }, [])
+      }, [runFind])
 
       React.useEffect(() => {
         if (String(query || '').trim() === '') {
           setResults(null)
           setSearchError(null)
+          setFindResults(null)
+          setFindError(null)
+          findQRef.current = ''
           return undefined
         }
         const timer = setTimeout(() => {
@@ -974,7 +1015,38 @@ window.__ModuleLoader__.load({
                 rows === null
                   ? null
                   : rows.length === 0
-                    ? h('div', { className: 'ima-kb-hint' }, t.noResult)
+                    ? h(
+                        React.Fragment,
+                        null,
+                        h('div', { className: 'ima-kb-hint' }, t.noResult),
+                        findError !== null
+                          ? h('div', { className: 'ima-kb-hint' }, t.findFailed + findError)
+                          : null,
+                        findResults !== null && Array.isArray(findResults.items) && findResults.items.length > 0
+                          ? h(
+                              'div',
+                              { className: 'ima-kb-find' },
+                              h('div', { className: 'ima-kb-group' }, t.findHeading(findResults.total)),
+                              findResults.items.map((item, index) =>
+                                h(
+                                  'div',
+                                  {
+                                    key: 'find-' + index,
+                                    className: 'ima-kb-row',
+                                    role: 'button',
+                                    tabIndex: 0,
+                                    onClick: () => openNote(item.noteId, 0, null),
+                                  },
+                                  h('div', { className: 'ima-kb-row-title' }, item.title),
+                                  h('div', { className: 'ima-kb-row-meta' }, 'note_id ' + item.noteId),
+                                  item.preview !== ''
+                                    ? h('div', { className: 'ima-kb-snippet' }, item.preview)
+                                    : null,
+                                ),
+                              ),
+                            )
+                          : null,
+                      )
                     : rows.map((match, index) =>
                         h(
                           'div',
@@ -1404,6 +1476,7 @@ window.__ModuleLoader__.load({
       '.ima-kb-row-meta{font-size:11px;color:var(--dsw-alias-label-secondary);margin-top:2px}',
       '.ima-kb-badge{display:inline-block;font-size:10px;line-height:16px;padding:0 6px;border-radius:999px;border:1px solid var(--dsw-alias-border-l1);color:var(--dsw-alias-label-secondary);margin-right:6px}',
       '.ima-kb-snippet{font-size:11.5px;color:var(--dsw-alias-label-secondary);margin-top:4px;line-height:1.55;word-break:break-word;display:-webkit-box;-webkit-line-clamp:3;-webkit-box-orient:vertical;overflow:hidden}',
+      '.ima-kb-find{border-top:1px dashed var(--dsw-alias-border-l1);margin:4px 6px;padding-top:2px}',
       '.ima-kb-crumb{display:flex;align-items:center;flex-wrap:wrap;gap:2px;padding:6px 10px 2px;font-size:11.5px}',
       '.ima-kb-crumb-item{color:var(--dsw-alias-label-secondary);display:inline-flex;align-items:center;gap:2px;white-space:nowrap}',
       '.ima-kb-crumb-link{font:inherit;font-size:11.5px;color:var(--dsw-alias-label-secondary);background:none;border:none;padding:2px 3px;border-radius:5px;cursor:pointer}',

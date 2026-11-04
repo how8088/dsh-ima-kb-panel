@@ -10,6 +10,12 @@
 
 > 为什么要这个插件：ima 的 OpenAPI 里 `get_doc_content` **没有分页参数**，一篇几十万字的笔记会被一次性塞进上下文。这个插件把「检索 + 按字符偏移分页读」补上了，并且把浏览这件事搬到侧边栏，不占上下文。
 
+## 1.4.0 新功能
+
+- **`kb_find(query, start?)`**：ima 官方 `search_note` 分词召回——**换一种说法也能找到**。
+  与 `kb_search`（本地字面匹配、带 offset）互补：不确定原文措辞先用 `kb_find` 找候选篇。
+- 面板字面检索无命中时自动补一轮模糊检索，结果直接可点开。
+
 ## 1.3.0 新功能
 
 - 面板分「笔记 / 知识库」两个页签；笔记列表自动按标题分类（篇数 + 字数徽标、可折叠）
@@ -131,6 +137,7 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
 | `kb_list(query?)` | 列出全部笔记：标题、`note_id`、字数、开头预览；笔记多时可用 `query` 只列标题含该词的 | ✅ |
 | `kb_search(query, note_id?, limit?)` | 全库**子串**检索，一篇可回多段，带字符偏移量 | ✅ 片段 ≤ 600 字，默认 8 段 |
 | `kb_read(note_id, offset?, limit?)` | 按偏移分页读正文 | ✅ 默认 6000 字，上限 3 万字 |
+| `kb_find(query, start?)` | ima **官方分词检索**：换一种说法也能找到，返回命中笔记列表 | ✅ 每页 20 篇 |
 | `kb_space_list()` | 列出可见的知识库（`kb_id`、文件数、说明、角色） | ✅ |
 | `kb_space_browse(kb_id, folder_id?, limit?)` | 列目录：文件夹 / 文件（`media_id`、类型） | ✅ 单页 ≤ 50 条 |
 | `kb_space_search(kb_id, query, limit?)` | 按**文件名/文件夹名**检索（不搜正文） | ✅ ≤ 50 条 |
@@ -154,6 +161,7 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
 | `GET /ima-kb/api/warm-status` | 预热进度快照：`running/total/done/failed/cached/listed` |
 | `GET /ima-kb/api/note?id=&start=&length=` | 正文切片 |
 | `GET /ima-kb/api/search?q=&limit=` | 检索结果 |
+| `GET /ima-kb/api/find?q=&start=` | ima 官方分词检索（kb_find 同款） |
 | `GET /ima-kb/api/refresh` | 清缓存（列表 + 正文 + 凭证 + 知识库目录） |
 | `GET /ima-kb/api/kb` | 知识库列表（id、名称、文件数、说明、角色） |
 | `GET /ima-kb/api/kb-files?kb=&folder=&cursor=` | 目录内容 + 面包屑（文件夹 99 / PDF 1 / Word 3） |

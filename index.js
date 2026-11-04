@@ -914,6 +914,49 @@ function invalidateKbCaches() {
   kbDirCache.clear()
 }
 
+// ── 笔记官方检索（分词召回，弥补本地字面检索「换一种说法就搜不到」） ──
+/** search_note 每页上限。 */
+const FIND_PAGE_SIZE = 20
+/** 最多翻到第几页（20 条/页）。 */
+const FIND_MAX_PAGES = 10
+
+/**
+ * 用 ima 官方 search_note 做内容检索：服务端分词召回，不要求原文逐字一致，
+ * 所以「亏了怎么办」也可能找到「止损」。每篇只回一段摘要，拿到 note_id 后用
+ * kb_read 读正文。短词（如单个双字词）偶尔被服务端拒绝（code!=0），此时原样
+ * 抛出错误，由调用方给用户提示。
+ */
+async function findNotes(query, options) {
+  const q = String(query ?? '').trim()
+  if (q === '') return { total: 0, items: [], more: false }
+  const start = clamp(options?.start ?? 0, 0, FIND_MAX_PAGES * FIND_PAGE_SIZE)
+  const end = clamp(options?.end ?? FIND_PAGE_SIZE, start + 1, start + FIND_PAGE_SIZE)
+  const data = await imaApi('openapi/note/v1/search_note', {
+    search_type: 1,
+    query_info: { content: q },
+    start,
+    end,
+  })
+  const rows = Array.isArray(data?.search_note_infos) ? data.search_note_infos : []
+  const items = []
+  for (const row of rows) {
+    if (row === null || typeof row !== 'object') continue
+    const info = row.note_book_info
+    if (info === null || typeof info !== 'object' || !info.note_id) continue
+    items.push({
+      noteId: String(info.note_id),
+      title: typeof info.title === 'string' && info.title !== '' ? info.title : String(info.note_id),
+      preview: typeof info.summary === 'string' ? info.summary.replace(/\s+/g, ' ').trim().slice(0, 160) : '',
+    })
+  }
+  const total = Number(data?.total_hit_num) || items.length
+  return {
+    total,
+    items,
+    more: data?.is_end === false,
+  }
+}
+
 // ── 工具 ────────────────────────────────────────────────────────────────
 const TEXT_OUTPUT = {
   schema: { type: 'string' },
@@ -1056,6 +1099,50 @@ function registerTools(ctx) {
           ? '[已到笔记末尾]'
           : `[还有 ${formatCount(total - end)} 字未读，下一段 offset=${end}]`
       return `${header}\n\n${content.slice(offset, end)}\n\n${footer}`
+    },
+  })
+
+  // ── 官方检索：分词召回，换个说法也能找到 ──
+  registerTool(ctx, {
+    name: 'kb_find',
+    description:
+      '在用户私有 ima 笔记里做官方全文检索（服务端分词召回，不要求逐字一致，换一种说法也可能找到），'
+      + '返回命中的笔记列表（note_id、标题、开头预览、总命中数）。每篇只回一条摘要，'
+      + '拿到 note_id 后用 kb_read(note_id, 0) 读该篇正文。'
+      + '只在用户明确要求查看或检索自己的知识库时使用；用户没有要求时不要主动调用。'
+      + '与 kb_search 的分工：要精确词句与多处命中用 kb_search（本地字面匹配、带偏移量）；'
+      + '不确定原文措辞时先用 kb_find 找候选篇。',
+    parameters: {
+      query: { type: 'string', required: true, description: '要查的话题或问题，用自然语言描述也可以。' },
+      start: { type: 'number', description: '从第几条开始（0 起），用于翻页；默认 0。' },
+    },
+    output: TEXT_OUTPUT,
+    async execute(args) {
+      const q = typeof args?.query === 'string' ? args.query.trim() : ''
+      if (q === '') return 'query 不能为空。'
+      const start = clamp(args?.start ?? 0, 0, FIND_MAX_PAGES * FIND_PAGE_SIZE)
+      let result
+      try {
+        result = await findNotes(q, { start, end: start + FIND_PAGE_SIZE })
+      } catch (error) {
+        return `ima 官方检索没成功（${error instanceof Error ? error.message : String(error)}）。\n`
+          + '短词常被服务端拒绝：换更完整的关键词，或改用 kb_search 做字面检索。'
+      }
+      if (result.items.length === 0) {
+        return `官方检索没有命中「${q}」。\n`
+          + '试试：换别的措辞；或改用 kb_search 精确检索；或 kb_list 看全部笔记标题。'
+      }
+      const lines = [
+        `官方检索「${q}」命中 ${formatCount(result.total)} 篇${result.more ? '（还有更多，用 kb_find(query, start=' + (start + FIND_PAGE_SIZE) + ') 翻页）' : ''}：`,
+        '',
+      ]
+      for (const item of result.items) {
+        lines.push(`- ${item.title}`)
+        lines.push(`  note_id: ${item.noteId}`)
+        if (item.preview !== '') lines.push(`  开头：${item.preview}`)
+      }
+      lines.push('', '读取某一篇：kb_read(note_id=<上面的 id>, offset=0)。')
+      return lines.join('\n')
     },
   })
 
@@ -1297,6 +1384,23 @@ function registerRoutes(ctx) {
         }
         const limit = clamp(url.searchParams.get('limit') ?? 12, WINDOW_LIMIT_MIN, WINDOW_LIMIT_MAX)
         sendJson(res, 200, { ...(await searchNotes(terms, { limit })), warm: warmSnapshot() })
+        return
+      }
+      if (route === 'find') {
+        const q = (url.searchParams.get('q') ?? '').trim()
+        if (q === '') {
+          sendJson(res, 200, { total: 0, items: [], more: false })
+          return
+        }
+        const start = clamp(url.searchParams.get('start') ?? 0, 0, FIND_MAX_PAGES * FIND_PAGE_SIZE)
+        try {
+          sendJson(res, 200, await findNotes(q, { start, end: start + FIND_PAGE_SIZE }))
+        } catch (error) {
+          sendJson(res, 200, {
+            total: 0, items: [], more: false,
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
         return
       }
       if (route === 'refresh') {

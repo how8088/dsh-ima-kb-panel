@@ -107,7 +107,7 @@ mod.apply(boot1.ctx, { cacheDir })
 check('export name', mod.name === 'ima-kb-panel', String(mod.name))
 check('export Config', mod.Config !== undefined, 'missing Config')
 check('1 route registered', boot1.routes.length === 1 && boot1.routes[0].path === '/ima-kb/api', JSON.stringify(boot1.routes.map((r) => r.path)))
-check('6 tools registered', boot1.tools.map((t) => t.name).join(',') === 'kb_list,kb_search,kb_read,kb_space_list,kb_space_browse,kb_space_search', boot1.tools.map((t) => t.name).join(','))
+check('7 tools registered', boot1.tools.map((t) => t.name).join(',') === 'kb_list,kb_search,kb_read,kb_find,kb_space_list,kb_space_browse,kb_space_search', boot1.tools.map((t) => t.name).join(','))
 
 const call = makeCaller(boot1.routes[0])
 
@@ -177,6 +177,16 @@ if (matches.length > 0) {
 const miss = await call('/ima-kb/api/search?q=' + encodeURIComponent('这个词肯定不在知识库里xyzzy'))
 check('搜不到时 matches 为空且不报错', miss.status === 200 && (miss.body.matches || []).length === 0, JSON.stringify(miss.body).slice(0, 80))
 
+// ── 4b. /find 官方分词检索 ────────────────────────────────────────────
+console.log('=== /find (官方分词检索) ===')
+const findRes = await call('/ima-kb/api/find?q=' + encodeURIComponent('复盘'))
+check('/find 200', findRes.status === 200 && Array.isArray((findRes.body || {}).items), String(findRes.status))
+const findItems = (findRes.body && findRes.body.items) || []
+check('/find 有命中', findItems.length > 0 && typeof findRes.body.total === 'number' && findRes.body.total > 0, `total=${findRes.body.total} items=${findItems.length}`)
+check('/find 项带 noteId/标题', findItems.every((x) => typeof x.noteId === 'string' && x.noteId !== '' && typeof x.title === 'string'), JSON.stringify(findItems[0]).slice(0, 140))
+const findEmpty = await call('/ima-kb/api/find?q=')
+check('/find 空查询返回空', findEmpty.status === 200 && (findEmpty.body.items || []).length === 0, JSON.stringify(findEmpty.body).slice(0, 80))
+
 // ── 5. 工具 ──────────────────────────────────────────────────────────
 console.log('=== tools ===')
 const kbList = boot1.tools.find((t) => t.name === 'kb_list')
@@ -191,6 +201,9 @@ const kbRead = boot1.tools.find((t) => t.name === 'kb_read')
 const readText = await kbRead.execute({ note_id: rows[0].id, offset: 0, limit: 120 }, {})
 check('kb_read 分页头', readText.includes('字符 0–') && readText.includes('共'), readText.slice(0, 80))
 check('kb_read 给 next offset', readText.includes('offset=') || readText.includes('[已到笔记末尾]'), readText.slice(-80))
+const kbFind = boot1.tools.find((t) => t.name === 'kb_find')
+const findText = await kbFind.execute({ query: '复盘' }, {})
+check('kb_find 返回命中笔记', findText.includes('命中') && findText.includes('note_id:'), findText.slice(0, 160))
 
 // ── 5b. 个人知识库（wiki 侧）─────────────────────────────────────────
 console.log('=== knowledge bases ===')
