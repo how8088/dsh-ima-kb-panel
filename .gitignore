@@ -12,3 +12,7 @@ Thumbs.db
 .env
 **/client_id
 **/api_key
+
+# test stubs（DSH 内部包的替身，让 host-e2e 能独立跑）
+!test/node_modules/
+!test/node_modules/**

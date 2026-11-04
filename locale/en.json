@@ -1,6 +1,6 @@
 {
   "meta": {
     "title": "ima Knowledge Base",
-    "description": "Adds an ima Knowledge Base entry to the sidebar for browsing, full-text searching and reading your own ima notes, and gives the conversation paged read tools so a whole 500K-character note never floods the context."
+    "description": "Adds an ima Knowledge Base entry to the sidebar for browsing, full-text searching and reading all of your own ima notes, and gives the conversation paged read tools so a whole 500K-character note never floods the context."
   }
 }
