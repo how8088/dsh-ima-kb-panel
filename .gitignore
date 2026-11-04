@@ -1,0 +1,14 @@
+# 依赖与产物
+node_modules/
+*.tgz
+pnpm-lock.yaml
+
+# 本机文件
+.DS_Store
+Thumbs.db
+*.log
+
+# 凭证绝不能进仓库
+.env
+**/client_id
+**/api_key

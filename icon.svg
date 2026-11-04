@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64" role="img" aria-label="ima Knowledge Base">
+  <title>ima Knowledge Base</title>
+  <defs>
+    <linearGradient id="imaKbCover" x1="10" y1="6" x2="54" y2="58" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#3B82F6"/>
+      <stop offset="1" stop-color="#1D4ED8"/>
+    </linearGradient>
+  </defs>
+  <rect x="9" y="7" width="46" height="50" rx="8" fill="url(#imaKbCover)"/>
+  <path d="M18 18.5h12.5M18 27h12.5M18 35.5h9" stroke="#FFFFFF" stroke-width="3.4" stroke-linecap="round" opacity="0.95"/>
+  <circle cx="40.5" cy="34" r="8.4" fill="none" stroke="#FFFFFF" stroke-width="3.2"/>
+  <path d="M46.6 40.4 52 45.8" stroke="#FFFFFF" stroke-width="3.4" stroke-linecap="round"/>
+  <path d="M17.5 44c2.6-2.2 5.6-2.2 8.6-.4" stroke="#BFDBFE" stroke-width="2.6" stroke-linecap="round" opacity="0.9"/>
+</svg>

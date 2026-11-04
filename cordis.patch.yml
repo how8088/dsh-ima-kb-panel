@@ -1,0 +1,7 @@
+# ima knowledge-base panel.
+# Host half: registers the read-only /ima-kb/api routes and the kb_list /
+# kb_search / kb_read tools. Client half: adds the sidebar entry and the
+# main-column panel.
+- insert:
+    - id: ima-kb-panel
+      name: 'dsh-ima-kb-panel'
