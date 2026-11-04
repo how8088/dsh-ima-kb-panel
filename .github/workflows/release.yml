@@ -1,0 +1,21 @@
+name: Pack plugin tarball
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  pack:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '22' }
+      - run: |
+          node --check client.js
+          cp index.js /tmp/index.mjs && node --check /tmp/index.mjs
+      - run: npm pack
+      - run: gh release create "$GITHUB_REF_NAME" ./*.tgz --generate-notes --title "$GITHUB_REF_NAME"
+        env:
+          GH_TOKEN: ${{ github.token }}
