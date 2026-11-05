@@ -86,6 +86,29 @@ plugin_manager(action="install_bundle", target="<本仓库目录的绝对路径>
 
 > ⚠️ 用目录安装是 **软链接**（`link:`），DSH 会报 `restart-required`；用 `.tgz` 安装是真实拷贝，热应用更顺。**改完代码要重新 `pnpm pack` 再装**。
 
+### 方式 D：从 GitHub 更新（换电脑 / 升级，推荐）
+
+只升级**插件本身**可以完全走 GitHub：每个 `v*` tag 会由 Actions 自动打包并发 Release。
+
+1. 打开 Releases：`github.com/how8088/dsh-ima-kb-panel/releases`（仓库是私有的，用自己账号登录）
+2. 下载最新的 `dsh-ima-kb-panel-<版本>.tgz`
+3. 在 DSH 里新开会话，把这句话发给 AI（路径换成实际路径）：
+   ```
+   请用 plugin_manager 安装本地插件：<tgz 完整路径>
+   ```
+4. 重启 DSH（或刷新页面）
+
+**第一次在新电脑上装完整体系**（这四样不在插件包里，各处理一次）：
+
+| 东西 | 怎么弄 |
+|---|---|
+| ima 凭证 | 把 `~/.config/ima/client_id` 与 `api_key` 复制到新电脑同路径（**绝不要进仓库**） |
+| 两个技能 | 把本仓库 `skills/market-research/`、`skills/ima-kb/` 复制到 `~/.dsh/skills/` |
+| AGENTS.md 联动段 | 把本仓库 `docs/AGENTS-联动段.md` 的内容追加到 `~/.dsh/AGENTS.md` |
+| 通达信 MCP | 在新电脑的 DSH 里配置（token 只在你自己的机器上，仓库里没有） |
+
+> 为什么不把技能打进插件自动安装：技能是你会自己改的文档，插件自动覆盖会冲掉你的修改，所以放在仓库 `skills/` 里按需复制。
+
 ## 4. 装完怎么确认可用
 
 1. 重启 DSH，左侧图标栏应出现 **书本+放大镜** 图标（在插件 / Skill·MCP / 市场 后面）
