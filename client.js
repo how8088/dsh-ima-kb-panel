@@ -107,6 +107,9 @@ window.__ModuleLoader__.load({
         kbCacheConfirmClear: '确认清空？',
         refreshConfirm: '确认刷新？',
         refreshHint: '清空正文缓存并重新抓取全部笔记（约 1 分钟）。',
+        cacheAll: '缓存全部正文',
+        cacheAllHint: (done, total) => `本地已有 ${done}/${total} 篇；会补齐其余并重取变过的笔记（约 1 分钟）。`,
+        cacheMissing: (n) => `本地还有 ${n} 篇正文没缓存，这次只搜了已缓存的部分；点右上「⋯ → 缓存全部正文」补齐。`,
         kbCacheWarming: (stage, done, total) => stage === 'text' ? `正在缓存正文 ${done}/${total}` : '正在缓存目录…',
         kbCacheDone: (files, texts, failed) => `已缓存 ${files} 个文件${texts > 0 ? `、${texts} 篇正文` : ''}${failed > 0 ? `，${failed} 篇失败` : ''}`,
         kbCacheShared: '订阅 / 加入的知识库不做本地缓存，按需在线读取。',
@@ -204,6 +207,9 @@ window.__ModuleLoader__.load({
         kbCacheConfirmClear: 'Confirm clear?',
         refreshConfirm: 'Confirm refresh?',
         refreshHint: 'Clear cached texts and re-fetch every note (about a minute).',
+        cacheAll: 'Cache all texts',
+        cacheAllHint: (done, total) => `${done}/${total} cached; fills in the rest and re-fetches changed notes (about a minute).`,
+        cacheMissing: (n) => `${n} notes have no cached text yet, so this search covered the cached ones only. Use “⋯ → Cache all texts”.`,
         kbCacheWarming: (stage, done, total) => stage === 'text' ? `Caching texts ${done}/${total}` : 'Caching folders…',
         kbCacheDone: (files, texts, failed) => `Cached ${files} files${texts > 0 ? `, ${texts} texts` : ''}${failed > 0 ? `, ${failed} failed` : ''}`,
         kbCacheShared: 'Subscribed / joined spaces are not cached locally; they stay online-only.',
@@ -611,6 +617,8 @@ window.__ModuleLoader__.load({
       const [searching, setSearching] = React.useState(false)
       const [searchError, setSearchError] = React.useState(null)
       const [searchPartial, setSearchPartial] = React.useState(false)
+      /** 本地还没缓存的正文篇数：>0 表示这次检索只覆盖了一部分。 */
+      const [searchMissing, setSearchMissing] = React.useState(0)
       const rerunRef = React.useRef(false)
       /** 字面检索没命中时，自动用官方分词检索补一轮（kb_find）。 */
       const [findResults, setFindResults] = React.useState(snap === null ? null : snap.findResults)
@@ -697,8 +705,7 @@ window.__ModuleLoader__.load({
           setTruncated(Boolean(payload && payload.truncated))
           setMaxNotes(payload && typeof payload.maxNotes === 'number' ? payload.maxNotes : null)
           setWarm(payload && payload.warm ? payload.warm : null)
-          const needWarm = rows.some((note) => note === null || typeof note.chars !== 'number')
-          if (needWarm) startWarm()
+          // 不再自动预热：正文只有你点「缓存全部正文」时才会拉下来。
         } catch (error) {
           setNotes([])
           setNotesError(error)
@@ -856,6 +863,9 @@ window.__ModuleLoader__.load({
           const payload = await getJson(API + '/search?q=' + encodeURIComponent(terms.join(' ')) + '&limit=' + SNIPPET_LIMIT)
           setResults(payload)
           setSearchPartial(Boolean(payload && payload.warming))
+          setSearchMissing(payload && typeof payload.totalNotes === 'number'
+            ? Math.max(0, payload.totalNotes - (typeof payload.cachedNotes === 'number' ? payload.cachedNotes : 0))
+            : 0)
           if (payload && payload.warm) setWarm(payload.warm)
           const matches = payload && Array.isArray(payload.matches) ? payload.matches : []
           if (matches.length === 0 && !(payload && payload.warming)) {
@@ -880,6 +890,7 @@ window.__ModuleLoader__.load({
           setSearchError(null)
           setFindResults(null)
           setFindError(null)
+          setSearchMissing(0)
           findQRef.current = ''
           return undefined
         }
@@ -1519,6 +1530,7 @@ window.__ModuleLoader__.load({
       const warmDone = warm && typeof warm.done === 'number' ? warm.done : 0
       const warmTotal = warm && typeof warm.total === 'number' ? warm.total : 0
       const warmPercent = warmTotal > 0 ? Math.min(100, Math.round((warmDone / warmTotal) * 100)) : 0
+      /** 本地已缓存 / 全库篇数（菜单里给「缓存全部正文」做说明）。 */
       const warmCached = warm && typeof warm.cached === 'number' ? warm.cached : 0
       const warmListed = warm && typeof warm.listed === 'number' ? warm.listed : 0
       const cacheNote = warmRunning
@@ -1625,6 +1637,9 @@ window.__ModuleLoader__.load({
                 searchError !== null ? h('div', { className: 'ima-kb-hint' }, searchError) : null,
                 searchPartial && !searching
                   ? h('div', { className: 'ima-kb-hint' }, t.partial(warmDone, warmTotal))
+                  : null,
+                searchMissing > 0 && !searching && !searchPartial
+                  ? h('div', { className: 'ima-kb-hint' }, t.cacheMissing(searchMissing))
                   : null,
                 rows === null
                   ? null
@@ -2112,6 +2127,20 @@ window.__ModuleLoader__.load({
               ? h(
                   'div',
                   { className: 'ima-kb-headmenu-pop', onMouseDown: (event) => event.stopPropagation() },
+                  h(
+                    'button',
+                    {
+                      className: 'ima-kb-kbcache-item',
+                      type: 'button',
+                      disabled: warming || loadingNotes,
+                      onClick: () => {
+                        setHeadMenu(false)
+                        startWarm()
+                      },
+                    },
+                    t.cacheAll,
+                  ),
+                  h('div', { className: 'ima-kb-headmenu-hint' }, t.cacheAllHint(warmCached, warmListed)),
                   h(
                     'button',
                     {

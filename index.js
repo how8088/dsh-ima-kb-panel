@@ -120,6 +120,9 @@ export const Config = Schema.object({
   autoInstallSkills: Schema.string()
     .default('on')
     .description("插件启动时把随包的技能装到 skillsDir；已存在就不覆盖。填 off 关闭"),
+  autoWarm: Schema.string()
+    .default('off')
+    .description("是否在启动/检索时自动把全部笔记正文拉到本地；默认 off，只有手动点「缓存全部正文」才取。填 on 恢复后台自动预热"),
   kbCacheTtlMinutes: Schema.number()
     .step(1)
     .min(1)
@@ -210,6 +213,7 @@ const settings = {
   titleFilter: [],
   skillsDir: '',
   autoInstallSkills: 'on',
+  autoWarm: 'off',
   kbCacheTtlMs: 10080 * 60 * 1000,
   kbCacheText: 'on',
   kbCacheMaxFiles: 2000,
@@ -241,6 +245,7 @@ function resolveSettings(raw) {
   settings.cacheDir = rawCacheDir === '-' ? '' : rawCacheDir || DEFAULT_CACHE_DIR
   settings.skillsDir = nonEmptyString(config.skillsDir)
   settings.autoInstallSkills = config.autoInstallSkills === 'off' ? 'off' : 'on'
+  settings.autoWarm = config.autoWarm === 'on' ? 'on' : 'off'
   settings.kbCacheTtlMs = clamp(config.kbCacheTtlMinutes ?? 10080, 1, 525600) * 60 * 1000
   settings.kbCacheText = config.kbCacheText === 'off' ? 'off' : 'on'
   settings.kbCacheMaxFiles = clamp(config.kbCacheMaxFiles ?? 2000, 1, 50000)
@@ -1061,9 +1066,11 @@ async function searchNotes(terms, options) {
   if (targets.length === 0) {
     throw new Error(`知识库里没有 note_id=${onlyNote} 这篇笔记。先用 kb_list 看可用的 id。`)
   }
-  // 正文没取全时先给后台预热一点时间；等不到就带着「结果可能不全」的标记返回，
-  // 而不是把工具调用挂到被上层超时掐掉。
-  const complete = await waitForWarm(budget)
+  // autoWarm=on 时先给后台预热一点时间；默认 off 时不替用户拉正文——
+  // 本地有多少就搜多少，缺多少如实报出来。
+  const cachedTargets = targets.filter((note) => freshContent(note.id) !== undefined).length
+  const allCached = cachedTargets === targets.length
+  const complete = settings.autoWarm === 'on' ? await waitForWarm(budget) : allCached
 
   let charsScanned = 0
   let notesSkipped = 0
@@ -1122,6 +1129,8 @@ async function searchNotes(terms, options) {
     truncated: totalWindows > matches.length,
     matches,
     warming: complete === false,
+    cachedNotes: cachedTargets,
+    totalNotes: targets.length,
     warm: warmSnapshot(),
   }
 }
@@ -1483,8 +1492,10 @@ async function kbFileText(mediaId, title) {
     inlineUrl: '',
   }
   kbTextCache.set(mediaId, { at: Date.now(), value })
-  // 只有个人知识库的正文落盘；PDF / 未知类型不缓存（离线看重定向代理没有意义）。
-  if (mediaInPersonalKb(mediaId)) saveKbText(mediaId, value)
+  // 只有个人知识库、且这个库被手动缓存过（或正在手动预热）才落盘；
+  // 没缓存过的库只走内存，和你没点过「缓存到本地」时一样。
+  const owner = personalOwnerOf(mediaId)
+  if (owner !== undefined && kbPersistAllowed(owner)) saveKbText(mediaId, value)
   return value
 }
 
@@ -1646,7 +1657,20 @@ function kbDirKeyOf(folderId, cursor) {
   return String(cursor ?? '') + '|' + String(folderId ?? '')
 }
 
+/** 这个库有没有被手动缓存过（warm 成功会写 snap）。没缓存过就只走内存，不落盘。 */
+function kbHasSnapshot(kbId) {
+  if (kbDisk === null || kbDisk.snaps === null || typeof kbDisk.snaps !== 'object') return false
+  const snap = kbDisk.snaps[kbId]
+  return snap !== null && typeof snap === 'object'
+}
+
+/** 只有「手动预热中」或「这个库已经手动缓存过」才允许写磁盘。 */
+function kbPersistAllowed(kbId) {
+  return kbWarmState.running === true || kbHasSnapshot(kbId)
+}
+
 function saveKbDir(kbId, folderId, cursor, value) {
+  if (!kbPersistAllowed(kbId)) return
   ensureKbDiskLoaded()
   if (kbDisk === null) return
   const folders = kbDisk.dirs[kbId] ?? {}
@@ -1689,26 +1713,27 @@ function personalKbIdSet() {
   return ids
 }
 
-/** 这个文件是不是挂在某个个人知识库下（决定正文要不要落盘）。 */
-function mediaInPersonalKb(mediaId) {
+/** 这个文件挂在哪个个人知识库下；不属于个人库就返回 undefined。 */
+function personalOwnerOf(mediaId) {
   ensureKbDiskLoaded()
   const ids = personalKbIdSet()
-  if (ids.size === 0) return false
+  if (ids.size === 0) return undefined
   const has = (items) => Array.isArray(items) && items.some((item) => item.mediaId === mediaId)
   for (const kbId of ids) {
     const folders = kbDisk === null ? undefined : kbDisk.dirs[kbId]
     if (folders === undefined) continue
     for (const entry of Object.values(folders)) {
       const items = entry !== null && typeof entry === 'object' && entry.value !== null && typeof entry.value === 'object' ? entry.value.items : undefined
-      if (has(items)) return true
+      if (has(items)) return kbId
     }
   }
   for (const [dirKey, entry] of kbDirCache) {
-    if (!ids.has(dirKey.split('|')[0])) continue
+    const ownerId = dirKey.split('|')[0]
+    if (!ids.has(ownerId)) continue
     const items = entry !== null && typeof entry === 'object' && entry.value !== null && typeof entry.value === 'object' ? entry.value.items : undefined
-    if (has(items)) return true
+    if (has(items)) return ownerId
   }
-  return false
+  return undefined
 }
 
 /** 预热进度：面板用它显示「正在缓存目录 / 正文」。 */
@@ -2026,9 +2051,14 @@ function registerTools(ctx) {
         warmBudgetMs: SEARCH_WARM_BUDGET_TOOL_MS,
       })
       const skipped = result.notesSkipped > 0 ? `，${result.notesSkipped} 篇取正文失败被跳过` : ''
+      const missing = typeof result.totalNotes === 'number' && typeof result.cachedNotes === 'number'
+        ? result.totalNotes - result.cachedNotes
+        : 0
       const warming = result.warming === true
         ? `\n注意：正文还在后台载入（${result.warm.done}/${result.warm.total}），本次结果可能不全，稍等几十秒再检索一次。`
-        : ''
+        : missing > 0
+          ? `\n注意：本地只缓存了 ${result.cachedNotes}/${result.totalNotes} 篇正文，本次只搜了这些（不会自动后台拉取）。要搜全部，先在面板点「⋯ → 缓存全部正文」。`
+          : ''
       if (result.matches.length === 0) {
         return `在 ${result.notesScanned} 篇笔记（${formatCount(result.charsScanned)} 字${skipped}）里没有找到 ${terms.map((term) => `「${term}」`).join('')}。\n`
           + '检索是字面匹配：换用户材料里可能出现的原词试试，或用 kb_list 看有哪些笔记。'
@@ -2601,9 +2631,10 @@ export function apply(ctx, config) {
   ctx.inject(['tools'], (scoped) => {
     registerTools(scoped)
   })
-  // 启动后主动预热一轮：本次进程里第一次 kb_search / 面板检索就不用干等。
-  // 有磁盘缓存时这一步只是 4 次列表请求；插件卸载时计时器会被清掉。
+  // 启动后自动预热：默认关闭（autoWarm=off）。要不要把 229 万字的正文拉下来是用户的事，
+  // 插件不替他跑。需要时在面板「⋯ → 缓存全部正文」手动触发。
   ctx.effect(() => {
+    if (settings.autoWarm !== 'on') return () => {}
     let cancelled = false
     const timer = setTimeout(() => {
       if (cancelled) return
