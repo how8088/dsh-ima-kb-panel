@@ -2359,6 +2359,16 @@ function registerRoutes(ctx) {
           titleFilter: settings.titleFilter,
           noteCount,
           truncated,
+          cacheFile: cacheFile(),
+          cacheBytes: (() => {
+            const path = cacheFile()
+            if (path === '') return 0
+            try {
+              return statSync(path).size
+            } catch {
+              return 0
+            }
+          })(),
           warm: warmSnapshot(),
         })
         return
@@ -2455,6 +2465,12 @@ function registerRoutes(ctx) {
         if (kbId === '') {
           sendJson(res, 400, { error: 'missing kb' })
           return
+        }
+        // refresh=1：连知识库列表一起重新拉，避免用到磁盘里那份旧快照。
+        if (url.searchParams.get('refresh') === '1') {
+          kbListCache = undefined
+          ensureKbDiskLoaded()
+          if (kbDisk !== null) kbDisk.list = undefined
         }
         try {
           sendJson(res, 200, await warmPersonalKb(kbId))

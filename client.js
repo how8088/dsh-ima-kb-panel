@@ -101,15 +101,14 @@ window.__ModuleLoader__.load({
         kbCacheStats: (files, texts, size) => `${files} 个文件${texts > 0 ? ` · ${texts} 篇正文` : ''} · ${size}`,
         kbCacheAt: (when) => `快照 ${when}`,
         kbCacheWarm: '缓存到本地',
-        kbCacheUpdate: '更新快照',
-        kbCacheClear: '清空本地缓存',
+        kbCacheUpdate: '更新缓存',
+        kbCacheClear: '清空缓存',
         kbCacheMore: '更多操作',
         kbCacheConfirmClear: '确认清空？',
-        refreshConfirm: '确认刷新？',
-        refreshHint: '清空正文缓存并重新抓取全部笔记（约 1 分钟）。',
-        cacheAll: '缓存全部正文',
-        cacheAllHint: (done, total) => `本地已有 ${done}/${total} 篇；会补齐其余并重取变过的笔记（约 1 分钟）。`,
-        cacheMissing: (n) => `本地还有 ${n} 篇正文没缓存，这次只搜了已缓存的部分；点右上「⋯ → 缓存全部正文」补齐。`,
+        notesCacheNone: '还没缓存到本地；正文只在点开时在线读取。',
+        notesCacheStats: (n, size) => `已缓存 ${n} 篇 · ${size}`,
+        notesCachePartial: (done, total) => `已缓存 ${done}/${total} 篇`,
+        cacheMissing: (n) => `本地还有 ${n} 篇正文没缓存，这次只搜了已缓存的部分；点笔记栏顶部的「⋯ → 更新缓存」补齐。`,
         kbCacheWarming: (stage, done, total) => stage === 'text' ? `正在缓存正文 ${done}/${total}` : '正在缓存目录…',
         kbCacheDone: (files, texts, failed) => `已缓存 ${files} 个文件${texts > 0 ? `、${texts} 篇正文` : ''}${failed > 0 ? `，${failed} 篇失败` : ''}`,
         kbCacheShared: '订阅 / 加入的知识库不做本地缓存，按需在线读取。',
@@ -201,15 +200,14 @@ window.__ModuleLoader__.load({
         kbCacheStats: (files, texts, size) => `${files} files${texts > 0 ? ` · ${texts} texts` : ''} · ${size}`,
         kbCacheAt: (when) => `snapshot ${when}`,
         kbCacheWarm: 'Cache locally',
-        kbCacheUpdate: 'Refresh snapshot',
-        kbCacheClear: 'Clear local cache',
+        kbCacheUpdate: 'Update cache',
+        kbCacheClear: 'Clear cache',
         kbCacheMore: 'More actions',
         kbCacheConfirmClear: 'Confirm clear?',
-        refreshConfirm: 'Confirm refresh?',
-        refreshHint: 'Clear cached texts and re-fetch every note (about a minute).',
-        cacheAll: 'Cache all texts',
-        cacheAllHint: (done, total) => `${done}/${total} cached; fills in the rest and re-fetches changed notes (about a minute).`,
-        cacheMissing: (n) => `${n} notes have no cached text yet, so this search covered the cached ones only. Use “⋯ → Cache all texts”.`,
+        notesCacheNone: 'Nothing cached yet; texts are fetched online when you open a note.',
+        notesCacheStats: (n, size) => `${n} notes · ${size}`,
+        notesCachePartial: (done, total) => `${done}/${total} notes cached`,
+        cacheMissing: (n) => `${n} notes have no cached text yet, so this search covered the cached ones only. Use “⋯ → Update cache” above the note list.`,
         kbCacheWarming: (stage, done, total) => stage === 'text' ? `Caching texts ${done}/${total}` : 'Caching folders…',
         kbCacheDone: (files, texts, failed) => `Cached ${files} files${texts > 0 ? `, ${texts} texts` : ''}${failed > 0 ? `, ${failed} failed` : ''}`,
         kbCacheShared: 'Subscribed / joined spaces are not cached locally; they stay online-only.',
@@ -639,12 +637,14 @@ window.__ModuleLoader__.load({
       const [kbCache, setKbCache] = React.useState(null)
       const [kbCacheBusy, setKbCacheBusy] = React.useState(false)
       const [kbCacheMsg, setKbCacheMsg] = React.useState(null)
-      /** 危险/重活（更新快照、清空）收进「⋯」菜单，避免顺手点掉。 */
+      /** 危险/重活（更新缓存、清空缓存）收进「⋯」菜单，避免顺手点掉。 */
       const [kbCacheMenu, setKbCacheMenu] = React.useState(false)
       const [kbCacheConfirm, setKbCacheConfirm] = React.useState(false)
-      /** 顶栏的全局「刷新」同样是清缓存 + 全量重取，一起收进 ⋯。 */
-      const [headMenu, setHeadMenu] = React.useState(false)
-      const [refreshConfirm, setRefreshConfirm] = React.useState(false)
+      /** 笔记页签自己的缓存条（和知识库页签同款）。 */
+      const [notesCacheMenu, setNotesCacheMenu] = React.useState(false)
+      const [notesClearConfirm, setNotesClearConfirm] = React.useState(false)
+      const [notesCacheBytes, setNotesCacheBytes] = React.useState(0)
+
       const [kbQ, setKbQ] = React.useState(snap === null || typeof snap.kbQ !== 'string' ? '' : snap.kbQ)
       const [kbResults, setKbResults] = React.useState(snap === null ? null : snap.kbResults)
       const [kbSearching, setKbSearching] = React.useState(false)
@@ -682,6 +682,7 @@ window.__ModuleLoader__.load({
       }, [])
 
       // ── 笔记：预热 ──
+      /** 手动更新笔记缓存（/warm）：按 modify_time 增量补齐。 */
       const startWarm = React.useCallback(async () => {
         setWarming(true)
         try {
@@ -692,6 +693,12 @@ window.__ModuleLoader__.load({
           // 预热失败不影响列表：正文会在点开某一篇时按需取。
         } finally {
           setWarming(false)
+          try {
+            const state = await getJson(API + '/state')
+            if (state && typeof state.cacheBytes === 'number') setNotesCacheBytes(state.cacheBytes)
+          } catch {
+            // 缓存大小只是展示，取不到就算了。
+          }
         }
       }, [])
 
@@ -727,6 +734,7 @@ window.__ModuleLoader__.load({
           return
         }
         setConn(state)
+        setNotesCacheBytes(state !== null && typeof state.cacheBytes === 'number' ? state.cacheBytes : 0)
         if (state !== null && state.configured === false) {
           setNotes([])
           return
@@ -1020,6 +1028,12 @@ window.__ModuleLoader__.load({
         await loadNotes()
         if (selectedRef.current) openNote(selectedRef.current, 0, null)
         loadKbsRef.current()
+        try {
+          const state = await getJson(API + '/state')
+          if (state && typeof state.cacheBytes === 'number') setNotesCacheBytes(state.cacheBytes)
+        } catch {
+          // 清空后大小归零，取不到也无所谓。
+        }
       }, [loadNotes, openNote])
 
       // ── 知识库：列表 / 目录 / 检索 ──
@@ -1296,14 +1310,15 @@ window.__ModuleLoader__.load({
       }, [kbCacheMenu])
 
       React.useEffect(() => {
-        if (!headMenu) return undefined
+        if (!notesCacheMenu) return undefined
         const close = () => {
-          setHeadMenu(false)
-          setRefreshConfirm(false)
+          setNotesCacheMenu(false)
+          setNotesClearConfirm(false)
         }
         document.addEventListener('mousedown', close)
         return () => document.removeEventListener('mousedown', close)
-      }, [headMenu])
+      }, [notesCacheMenu])
+
 
       const runKbSearch = React.useCallback(async (value) => {
         const q = String(value || '').trim()
@@ -1613,6 +1628,81 @@ window.__ModuleLoader__.load({
               }
             },
           }),
+        ),
+        h(
+          'div',
+          { className: 'ima-kb-kbcache' },
+          h(
+            'div',
+            { className: 'ima-kb-kbcache-row' },
+            h('span', { className: 'ima-kb-kbcache-label' }, t.kbCacheTitle),
+            h(
+              'span',
+              { className: 'ima-kb-kbcache-text' },
+              warmRunning
+                ? t.kbCacheWarming('text', warmDone, warmTotal)
+                : warmListed === 0
+                  ? t.notesCacheNone
+                  : warmCached >= warmListed
+                    ? t.notesCacheStats(warmCached, formatBytes(notesCacheBytes))
+                    : t.notesCachePartial(warmCached, warmListed),
+            ),
+            warmRunning || loadingNotes
+              ? null
+              : h(
+                  'button',
+                  {
+                    className: 'ima-kb-kbcache-more',
+                    type: 'button',
+                    title: t.kbCacheMore,
+                    'aria-label': t.kbCacheMore,
+                    'aria-expanded': notesCacheMenu ? 'true' : 'false',
+                    onMouseDown: (event) => event.stopPropagation(),
+                    onClick: () => {
+                      setNotesCacheMenu((open) => !open)
+                      setNotesClearConfirm(false)
+                    },
+                  },
+                  '⋯',
+                ),
+          ),
+          notesCacheMenu && !warmRunning
+            ? h(
+                'div',
+                { className: 'ima-kb-kbcache-menu', onMouseDown: (event) => event.stopPropagation() },
+                h(
+                  'button',
+                  {
+                    className: 'ima-kb-kbcache-item',
+                    type: 'button',
+                    onClick: () => {
+                      setNotesCacheMenu(false)
+                      setNotesClearConfirm(false)
+                      startWarm()
+                    },
+                  },
+                  t.kbCacheUpdate,
+                ),
+                h(
+                  'button',
+                  {
+                    className: 'ima-kb-kbcache-item ima-kb-kbcache-item-danger',
+                    type: 'button',
+                    onClick: () => {
+                      // 清空会删掉已缓存的正文并重新拉列表，值得一次确认。
+                      if (!notesClearConfirm) {
+                        setNotesClearConfirm(true)
+                        return
+                      }
+                      setNotesClearConfirm(false)
+                      setNotesCacheMenu(false)
+                      onRefresh()
+                    },
+                  },
+                  notesClearConfirm ? t.kbCacheConfirmClear : t.kbCacheClear,
+                ),
+              )
+            : null,
         ),
         notesError !== null
           ? h(
@@ -2103,65 +2193,6 @@ window.__ModuleLoader__.load({
               t.tabKb(kbs !== null ? kbs.length : null),
             ),
           ),
-          h(
-            'div',
-            { className: 'ima-kb-headmenu' },
-            h(
-              'button',
-              {
-                className: 'ima-kb-kbcache-more',
-                type: 'button',
-                title: t.kbCacheMore,
-                'aria-label': t.kbCacheMore,
-                'aria-expanded': headMenu ? 'true' : 'false',
-                disabled: loadingNotes,
-                onMouseDown: (event) => event.stopPropagation(),
-                onClick: () => {
-                  setHeadMenu((open) => !open)
-                  setRefreshConfirm(false)
-                },
-              },
-              '⋯',
-            ),
-            headMenu
-              ? h(
-                  'div',
-                  { className: 'ima-kb-headmenu-pop', onMouseDown: (event) => event.stopPropagation() },
-                  h(
-                    'button',
-                    {
-                      className: 'ima-kb-kbcache-item',
-                      type: 'button',
-                      disabled: warming || loadingNotes,
-                      onClick: () => {
-                        setHeadMenu(false)
-                        startWarm()
-                      },
-                    },
-                    t.cacheAll,
-                  ),
-                  h('div', { className: 'ima-kb-headmenu-hint' }, t.cacheAllHint(warmCached, warmListed)),
-                  h(
-                    'button',
-                    {
-                      className: 'ima-kb-kbcache-item ima-kb-kbcache-item-danger',
-                      type: 'button',
-                      onClick: () => {
-                        if (!refreshConfirm) {
-                          setRefreshConfirm(true)
-                          return
-                        }
-                        setRefreshConfirm(false)
-                        setHeadMenu(false)
-                        onRefresh()
-                      },
-                    },
-                    refreshConfirm ? t.refreshConfirm : t.refresh,
-                  ),
-                  h('div', { className: 'ima-kb-headmenu-hint' }, t.refreshHint),
-                )
-              : null,
-          ),
         ),
         tab === 'notes' && warmRunning
           ? h(
@@ -2304,9 +2335,7 @@ window.__ModuleLoader__.load({
       '.ima-kb-kbcache-item{height:24px;padding:0 8px;font-size:11px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);cursor:pointer}',
       '.ima-kb-kbcache-item:hover{background:var(--dsw-alias-bg-layer-2)}',
       '.ima-kb-kbcache-item-danger{color:#d9534f;border-color:rgba(217,83,79,.45)}',
-      '.ima-kb-headmenu{position:relative;flex:0 0 auto}',
-      '.ima-kb-headmenu-pop{position:absolute;top:32px;right:0;z-index:30;display:flex;flex-direction:column;gap:6px;min-width:220px;padding:8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);box-shadow:0 8px 24px rgba(0,0,0,.18)}',
-      '.ima-kb-headmenu-hint{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary);max-width:240px}',
+
       '.ima-kb-search{flex:1 1 auto;min-width:0;padding:8px;box-sizing:border-box}',
       '.ima-kb-input{width:100%;height:30px;padding:0 10px;font-size:12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);outline:none;box-sizing:border-box}',
       '.ima-kb-input:focus{border-color:var(--dsw-alias-brand-primary)}',
