@@ -161,11 +161,20 @@ check('磁盘缓存已写入', cacheFiles.length === 1, JSON.stringify(cacheFile
 const cachePayload = cacheFiles.length === 1
   ? JSON.parse(readFileSync(join(cacheDir, cacheFiles[0]), 'utf8'))
   : null
-check('磁盘缓存 v2 结构', cachePayload !== null && cachePayload.version === 2 && Array.isArray(cachePayload.list && cachePayload.list.notes), `version=${cachePayload && cachePayload.version}`)
+check('磁盘缓存 v2 结构', cachePayload !== null && cachePayload.version === 3 && Array.isArray(cachePayload.list && cachePayload.list.notes), `version=${cachePayload && cachePayload.version}`)
 const cachedEntries = cachePayload === null ? [] : Object.values(cachePayload.notes || {})
 const withModified = cachedEntries.filter((entry) => typeof entry.modified === 'number').length
 check('正文缓存带 modify_time', cachedEntries.length > 0 && withModified >= cachedEntries.length, `${withModified}/${cachedEntries.length}`)
 check('磁盘缓存带笔记列表', cachePayload !== null && cachePayload.list.notes.length === rows.length, `${cachePayload && cachePayload.list && cachePayload.list.notes.length} vs ${rows.length}`)
+
+// v1.9.0：正文取自结构化格式（format=2）再转文本，必须保留段落换行；
+// 之前用 format=0，一篇 1708 字的笔记全文只有 2 个换行，阅读器里挤成一坨。
+const biggest = [...warmedRows].sort((left, right) => (right.chars || 0) - (left.chars || 0))[0]
+const biggestNote = await call(`/ima-kb/api/note?id=${encodeURIComponent(biggest.id)}&start=0&length=60000`)
+const biggestText = String((biggestNote.body && biggestNote.body.content) || '')
+const lineCount = (biggestText.match(/\n/g) || []).length
+check('正文保留段落换行', lineCount >= 10, `chars=${biggestText.length} newlines=${lineCount}`)
+check('正文不是原始 JSON', !biggestText.includes('"children":'), biggestText.slice(0, 80))
 
 // ── 4. /search 与偏移量契约 ───────────────────────────────────────────
 console.log('=== /search ===')

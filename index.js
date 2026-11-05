@@ -122,8 +122,8 @@ const WINDOW_LIMIT_MAX = 40
 const READ_LIMIT_DEFAULT = 6000
 const READ_LIMIT_MAX = 30000
 
-/** 磁盘缓存格式版本（v2 起带每篇 modify_time 与笔记列表）。 */
-const DISK_CACHE_VERSION = 2
+/** 磁盘缓存格式版本（v3 起正文是结构化格式转出的带换行文本）。 */
+const DISK_CACHE_VERSION = 3
 
 /** 运行时设置；apply 时由 Loader 解析后的 Config 覆盖。 */
 const settings = {
@@ -555,6 +555,87 @@ async function listNotes() {
   return capped
 }
 
+// ── 笔记正文：取结构化格式再转成可读文本 ────────────────────────────────
+/**
+ * ima 的 `target_content_format: 0`（纯文本）会把段落边界压平 ——
+ * 实测一篇 1708 字的「盘中记录」只剩 2 个换行，阅读器里全挤成一坨。
+ * `format: 2` 返回的是结构化块（h1/h2/p/列表…），所以这里换用 2，
+ * 再自己把块转成带换行的纯文本。
+ * @param {string} raw - ima 返回的 content 字段（JSON 字符串）
+ * @returns {string} 带段落换行的正文；解析失败返回空串
+ */
+function documentJsonToText(raw) {
+  let parsed
+  try {
+    parsed = JSON.parse(raw)
+  } catch {
+    return ''
+  }
+  const blocks = Array.isArray(parsed)
+    ? parsed
+    : Array.isArray(parsed?.blocks)
+      ? parsed.blocks
+      : Array.isArray(parsed?.children)
+        ? parsed.children
+        : []
+  if (blocks.length === 0) return ''
+
+  /** 收集一个块或行内的全部文字（含嵌套 children）。 */
+  const inlineText = (node) => {
+    if (node === null || node === undefined) return ''
+    if (typeof node === 'string') return node
+    if (typeof node !== 'object') return ''
+    let text = typeof node.text === 'string' ? node.text : ''
+    if (Array.isArray(node.children)) text += node.children.map(inlineText).join('')
+    return text
+  }
+
+  const out = []
+  for (const block of blocks) {
+    if (block === null || typeof block !== 'object') continue
+    const type = String(block.type || '').toLowerCase()
+    const text = inlineText(block).replace(/[ \t]+$/g, '')
+    const headingMatch = /^h([1-6])$/.exec(type)
+    if (headingMatch !== null) {
+      out.push(`${'#'.repeat(Number(headingMatch[1]))} ${text.trim()}\n\n`)
+      continue
+    }
+    if (type === 'p' || type === 'paragraph' || type === 'li' || type === 'list-item') {
+      const bullet = typeof block.listStyleType === 'string' && block.listStyleType !== '' ? '- ' : ''
+      out.push(`${bullet}${text}\n`)
+      continue
+    }
+    if (type === 'img' || type === 'image' || type === 'imageblock' || type === 'video') {
+      out.push('［图片］\n')
+      continue
+    }
+    if (type === 'table') {
+      // 表格没有统一结构：把行里的单元格文字用 | 串起来，至少能读。
+      const rows = Array.isArray(block.children) ? block.children : []
+      for (const row of rows) {
+        const cells = Array.isArray(row?.children) ? row.children.map((cell) => inlineText(cell).trim()) : []
+        if (cells.length > 0) out.push(`| ${cells.join(' | ')} |\n`)
+      }
+      continue
+    }
+    if (text !== '') out.push(`${text}\n`)
+  }
+  return out.join('').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+/**
+ * 兜底重排：万一拿到的是「几乎没有换行」的正文（老格式或异常笔记），
+ * 在日期 / 时间 / 发言人 / Markdown 标题前补换行，至少能分行阅读。
+ */
+function reflowFlatText(text) {
+  if (text.length < 1200) return text
+  const newlines = (text.match(/\n/g) || []).length
+  if (newlines * 400 >= text.length) return text
+  return text
+    .replace(/(?<!^|\n)(?=(?:\d{4}[-/年]\d{1,2}[-/月]\d{1,2}|\d{1,2}:\d{2}|发言人\d|#{1,4} ))/g, '\n')
+    .replace(/\n{3,}/g, '\n\n')
+}
+
 /**
  * 取一篇笔记的正文。
  * @param {string} noteId - 笔记 id。
@@ -571,9 +652,19 @@ async function noteContent(noteId, priority, modified) {
   }
   const data = await imaApi('openapi/note/v1/get_doc_content', {
     note_id: noteId,
-    target_content_format: 0,
+    target_content_format: 2,
   }, { priority: priority ?? 0 })
-  const content = typeof data?.content === 'string' ? data.content : ''
+  const raw = typeof data?.content === 'string' ? data.content : ''
+  let content = documentJsonToText(raw)
+  if (content === '') {
+    // 结构化解析失败（老笔记 / 返回形态变了）：退回纯文本，并做分行兜底。
+    const plain = await imaApi('openapi/note/v1/get_doc_content', {
+      note_id: noteId,
+      target_content_format: 0,
+    }, { priority: priority ?? 0 })
+    content = typeof plain?.content === 'string' ? plain.content : ''
+  }
+  content = reflowFlatText(content.replace(/\r\n?/g, '\n'))
   const entry = {
     content,
     at: Date.now(),

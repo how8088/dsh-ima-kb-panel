@@ -280,6 +280,26 @@ window.__ModuleLoader__.load({
       return Number(value).toLocaleString('en-US')
     }
 
+    /**
+     * 阅读区正文渲染：把行首的 Markdown 标题（`# ` ~ `#### `）渲染成带样式的标题行，
+     * 其余行原样保留（外层 pre-wrap 负责换行），同时保留搜索高亮。
+     */
+    function renderReaderBody(content, terms) {
+      const lines = String(content || '').split('\n')
+      return lines.map((line, index) => {
+        const heading = /^(#{1,4}) +(.+)$/.exec(line)
+        if (heading !== null) {
+          const level = heading[1].length
+          return h(
+            'div',
+            { key: 'rh-' + index, className: 'ima-kb-rh ima-kb-rh' + level },
+            highlight(heading[2], terms),
+          )
+        }
+        return h('span', { key: 'rl-' + index }, highlight(line, terms), '\n')
+      })
+    }
+
     /** 标题 → 分类。`2021Q2 · 雪球文章（95篇）` 归到「雪球文章 / 2021Q2」，
      *  `学员总结 · xxx` 归到「学员总结」，`未分类 · xxx` 归到「未分类」。 */
     function categorizeNote(title) {
@@ -1634,7 +1654,7 @@ window.__ModuleLoader__.load({
                 ? h(
                     'div',
                     { className: 'ima-kb-fileread' },
-                    fileText.text,
+                    h('div', { className: 'ima-kb-fileread-inner' }, renderReaderBody(fileText.text, [])),
                     fileText.truncated
                       ? h('div', { className: 'ima-kb-hint' }, t.fileTruncated(formatNumber(fileText.chars)))
                       : null,
@@ -1869,7 +1889,7 @@ window.__ModuleLoader__.load({
                     h(
                       'div',
                       { className: 'ima-kb-reader', onScroll: onReaderScroll, ref: readerRef },
-                      h('div', { className: 'ima-kb-reader-inner' }, highlight(doc.content, terms)),
+                      h('div', { className: 'ima-kb-reader-inner' }, renderReaderBody(doc.content, terms)),
                       loadingDoc ? h('div', { className: 'ima-kb-hint' }, t.counting) : null,
                     ),
                   ),
@@ -1932,6 +1952,12 @@ window.__ModuleLoader__.load({
       '.ima-kb-docmeta{font-size:11px;color:var(--dsw-alias-label-secondary);flex:0 0 auto}',
       '.ima-kb-reader{flex:1 1 auto;min-height:0;overflow:auto;padding:16px 20px;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.78}',
       '.ima-kb-reader-inner{max-width:860px;margin:0 auto}',
+      '.ima-kb-fileread-inner{max-width:900px;margin:0 auto}',
+      '.ima-kb-rh{margin:16px 0 8px;font-weight:600;line-height:1.5;color:var(--dsw-alias-label-primary)}',
+      '.ima-kb-rh1{font-size:16.5px}',
+      '.ima-kb-rh2{font-size:15px}',
+      '.ima-kb-rh3{font-size:14px}',
+      '.ima-kb-rh4{font-size:13.5px}',
       '.ima-kb-toc{flex:0 0 auto;max-height:38%;overflow:auto;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);padding:6px 10px}',
       '.ima-kb-toc-item{display:block;width:100%;text-align:left;font:inherit;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);background:none;border:none;border-radius:6px;padding:5px 8px;cursor:pointer}',
       '.ima-kb-toc-item:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
