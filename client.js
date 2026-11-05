@@ -98,6 +98,7 @@ window.__ModuleLoader__.load({
         // 个人知识库本地缓存
         kbCacheTitle: '本地缓存',
         kbCacheNone: '还没缓存到本地。缓存后断网也能翻目录和看正文。',
+        kbCachePartial: (dirs) => `已缓存 ${dirs} 个目录（整库缓存未完成，可重新更新）`,
         kbCacheStats: (files, texts, size) => `${files} 个文件${texts > 0 ? ` · ${texts} 篇正文` : ''} · ${size}`,
         kbCacheAt: (when) => `快照 ${when}`,
         kbCacheWarm: '缓存到本地',
@@ -197,6 +198,7 @@ window.__ModuleLoader__.load({
         kbBack: 'Up one level',
         kbCacheTitle: 'Local cache',
         kbCacheNone: 'Not cached yet. Cached spaces stay browsable offline.',
+        kbCachePartial: (dirs) => `${dirs} folders cached (bulk cache incomplete; run update again)`,
         kbCacheStats: (files, texts, size) => `${files} files${texts > 0 ? ` · ${texts} texts` : ''} · ${size}`,
         kbCacheAt: (when) => `snapshot ${when}`,
         kbCacheWarm: 'Cache locally',
@@ -1021,7 +1023,7 @@ window.__ModuleLoader__.load({
         setResults(null)
         setSearchError(null)
         try {
-          await getJson(API + '/refresh')
+          await getJson(API + '/refresh?scope=notes')
         } catch {
           // 清缓存失败就照常重取。
         }
@@ -1139,7 +1141,7 @@ window.__ModuleLoader__.load({
         setKbCacheMsg(null)
         const timer = setInterval(() => { loadKbCache() }, 2000)
         try {
-          const result = await getJson(API + '/kb-warm?kb=' + encodeURIComponent(selectedKb))
+          const result = await getJson(API + '/kb-warm?kb=' + encodeURIComponent(selectedKb) + '&refresh=1')
           if (result && typeof result.error === 'string') setKbCacheMsg(result.error)
           else if (result && typeof result.files === 'number') {
             setKbCacheMsg(t.kbCacheDone(result.files, result.texts || 0, result.failed || 0))
@@ -1150,6 +1152,8 @@ window.__ModuleLoader__.load({
           clearInterval(timer)
           setKbCacheBusy(false)
           loadKbCache()
+          // refresh=1 会重拉知识库列表，这里同步刷新左侧的库名/文件数。
+          loadKbsRef.current()
         }
       }, [selectedKb, loadKbCache, t])
 
@@ -1399,15 +1403,17 @@ window.__ModuleLoader__.load({
                           kbCache !== null && kbCache.warm !== null && typeof kbCache.warm === 'object' ? kbCache.warm.done : 0,
                           kbCache !== null && kbCache.warm !== null && typeof kbCache.warm === 'object' ? kbCache.warm.total : 0,
                         )
-                      : cacheEntry !== undefined && cacheEntry.snapshotAt > 0
-                        ? t.kbCacheAt(formatSnapshot(cacheEntry.snapshotAt))
-                          + ' · '
-                          + t.kbCacheStats(cacheEntry.files, cacheEntry.texts, formatBytes(kbCache === null ? 0 : kbCache.bytes))
-                        : t.kbCacheNone,
+                      : cacheEntry === undefined || cacheEntry.cached !== true
+                        ? t.kbCacheNone
+                        : cacheEntry.snapshotAt > 0
+                          ? t.kbCacheAt(formatSnapshot(cacheEntry.snapshotAt))
+                            + ' · '
+                            + t.kbCacheStats(cacheEntry.files, cacheEntry.texts, formatBytes(kbCache === null ? 0 : kbCache.bytes))
+                          : t.kbCachePartial(cacheEntry.dirs),
                   ),
                   kbCacheBusy
                     ? null
-                    : cacheEntry !== undefined && cacheEntry.snapshotAt > 0
+                    : cacheEntry !== undefined && cacheEntry.cached === true
                       ? h(
                           'button',
                           {
@@ -1647,7 +1653,7 @@ window.__ModuleLoader__.load({
                     ? t.notesCacheStats(warmCached, formatBytes(notesCacheBytes))
                     : t.notesCachePartial(warmCached, warmListed),
             ),
-            warmRunning || loadingNotes
+            warming || warmRunning || loadingNotes
               ? null
               : h(
                   'button',
@@ -2323,7 +2329,7 @@ window.__ModuleLoader__.load({
       '.ima-kb-tab{height:26px;padding:0 12px;font-size:12px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}',
       '.ima-kb-tab[data-active="true"]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}',
       '.ima-kb-tab:hover{color:var(--dsw-alias-label-primary)}',
-      '.ima-kb-kbcache{margin:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}',
+      '.ima-kb-kbcache{position:sticky;top:0;z-index:6;margin:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);box-shadow:0 2px 6px rgba(0,0,0,.06)}',
       '.ima-kb-kbcache-shared{color:var(--dsw-alias-label-secondary);font-size:11px}',
       '.ima-kb-kbcache-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
       '.ima-kb-kbcache-label{font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary)}',

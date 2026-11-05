@@ -204,7 +204,7 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
 | `GET /ima-kb/api/note?id=&start=&length=` | 正文切片 |
 | `GET /ima-kb/api/search?q=&limit=` | 检索结果 |
 | `GET /ima-kb/api/find?q=&start=` | ima 官方分词检索（kb_find 同款） |
-| `GET /ima-kb/api/refresh` | 清内存缓存（列表 + 正文 + 凭证 + 知识库目录）；个人知识库的**本地快照**不动，要清用 `kb-cache?clear=1` |
+| `GET /ima-kb/api/refresh` | 清内存缓存；`?scope=notes` 只清笔记、`?scope=kb` 只清知识库目录、默认 `all`。个人知识库的**本地快照**不动，要清用 `kb-cache?clear=1` |
 | `GET /ima-kb/api/kb` | 知识库列表（id、名称、文件数、说明、角色） |
 | `GET /ima-kb/api/kb-files?kb=&folder=&cursor=` | 目录内容 + 面包屑（文件夹 99 / PDF 1 / Word 3） |
 | `GET /ima-kb/api/kb-search?kb=&q=` | 按文件名检索（不搜正文） |

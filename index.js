@@ -1236,7 +1236,14 @@ async function isPersonalKbId(kbId) {
 async function listKbDirectory(kbId, folderId, cursor) {
   const dirKey = `${kbId}|${folderId}|${cursor}`
   const cached = kbDirCache.get(dirKey)
-  if (cached !== undefined && Date.now() - cached.at < KB_DIR_TTL_MS) return cached.value
+  if (cached !== undefined && Date.now() - cached.at < KB_DIR_TTL_MS) {
+    // 内存命中也要保证落盘：先浏览再点「更新缓存」时，这些目录本来就在内存里，
+    // 以前会直接 return 而不写盘，导致快照少一层。
+    if (diskKbDir(kbId, folderId, cursor) === undefined && await isPersonalKbId(kbId)) {
+      saveKbDir(kbId, folderId, cursor, cached.value)
+    }
+    return cached.value
+  }
   // 个人知识库：命中本地快照就直接用，不再打接口（订阅/加入的库没有落盘，走不到这里）。
   const fromDisk = diskKbDir(kbId, folderId, cursor)
   if (fromDisk !== undefined) {
@@ -1657,11 +1664,11 @@ function kbDirKeyOf(folderId, cursor) {
   return String(cursor ?? '') + '|' + String(folderId ?? '')
 }
 
-/** 这个库有没有被手动缓存过（warm 成功会写 snap）。没缓存过就只走内存，不落盘。 */
+/** 这个库有没有**仍然有效**的手动缓存快照。快照过期就等于没缓存：只走内存、不落盘。 */
 function kbHasSnapshot(kbId) {
   if (kbDisk === null || kbDisk.snaps === null || typeof kbDisk.snaps !== 'object') return false
   const snap = kbDisk.snaps[kbId]
-  return snap !== null && typeof snap === 'object'
+  return snap !== null && typeof snap === 'object' && kbFresh(snap)
 }
 
 /** 只有「手动预热中」或「这个库已经手动缓存过」才允许写磁盘。 */
@@ -1870,15 +1877,20 @@ function kbCacheStatus() {
           if (kbFresh(entry)) dirs += 1
         }
       }
+      // 目录过期（dirs=0）或只预热了一半（没有 snap）时，别把旧的快照数字报给面板，
+      // 否则会出现「显示 61 个文件、点开却在走网络」这种自相矛盾的状态。
+      const live = dirs > 0
+      const useSnap = live && kbHasSnapshot(kb.id)
       return {
         id: kb.id,
         name: kb.name,
         personal: isPersonalKb(kb),
         dirs,
-        snapshotAt: snap === undefined ? 0 : (Number(snap.at) || 0),
-        folders: snap === undefined ? 0 : (Number(snap.folders) || 0),
-        files: snap === undefined ? 0 : (Number(snap.files) || 0),
-        texts: snap === undefined ? 0 : (Number(snap.texts) || 0),
+        cached: live,
+        snapshotAt: useSnap ? (Number(snap.at) || 0) : 0,
+        folders: useSnap ? (Number(snap.folders) || 0) : 0,
+        files: useSnap ? (Number(snap.files) || 0) : 0,
+        texts: useSnap ? (Number(snap.texts) || 0) : 0,
       }
     }),
   }
@@ -2443,10 +2455,13 @@ function registerRoutes(ctx) {
         return
       }
       if (route === 'refresh') {
-        invalidateAll()
-        invalidateKbCaches()
-        credentialCache = undefined
-        sendJson(res, 200, { ok: true })
+        // scope=notes 只清笔记，scope=kb 只清知识库内存缓存；默认两边都清。
+        // 面板上两个页签各管各的缓存，不该互相牵连。
+        const scope = url.searchParams.get('scope') ?? 'all'
+        if (scope !== 'kb') invalidateAll()
+        if (scope !== 'notes') invalidateKbCaches()
+        if (scope === 'all') credentialCache = undefined
+        sendJson(res, 200, { ok: true, scope })
         return
       }
       // ── 知识库（wiki）──
