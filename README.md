@@ -225,7 +225,8 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
 | `个人知识库` | 杰尼龟的知识库（Markdown 版） | ✅ 目录 + 正文 |
 | `我加入的订阅知识库` | 宏观研报精选、深证信 | ❌ 在线读取（内存缓存 5/2/10 分钟照旧） |
 
-缓存到 `~/.dsh/cache/ima-kb-panel/kb-<hash>.json`，包含知识库列表、个人库的整棵目录树、以及 md/docx/txt 的正文文本（PDF 不缓存：内嵌查看走签名地址，离线没有意义）。
+缓存到 `~/.dsh/cache/ima-kb-panel/`：`kb-<hash>.json`（知识库列表 + 目录树 + md/docx/txt 正文）、
+`pdf/<mediaId>.bin`（PDF 原件，可选）。断网时目录、正文、文件名检索、PDF 查看都能从本地走。
 
 两个页签各有一条缓存条（都是只读状态 + 一个 `⋯`）：
 
@@ -241,6 +242,9 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
 | `kbCacheTtlMinutes` | 10080（7 天） | 个人库缓存保留多久 |
 | `kbCacheText` | `on` | 预热时是否连正文一起缓存；`off` 只存目录 |
 | `kbCacheMaxFiles` | 2000 | 单个个人库最多缓存多少篇正文 |
+| `kbCacheMaxMb` | 512 | 个人库缓存总容量上限（MB），超了先淘汰最久没取的正文、再淘汰最旧的 PDF |
+| `kbCachePdf` | `on` | 预热时是否连 PDF 原件一起存（离线也能翻页看） |
+| `kbCacheMaxPdfMb` | 20 | 单个 PDF 超过这个大小就不缓存 |
 
 > ⚠️ ima 的 `get_knowledge_list` **没有 modify_time**，所以这里没有「增量」：过期与否只看 TTL，想拿最新版就点「更新快照」。面板显示的快照时间就是这份数据的年龄。
 

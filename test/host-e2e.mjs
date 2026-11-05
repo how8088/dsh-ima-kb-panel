@@ -19,7 +19,7 @@
  *   4. 检索偏移量契约、工具输出、/refresh、磁盘缓存与冷启动命中。
  */
 import { createHash } from 'node:crypto'
-import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -160,17 +160,18 @@ console.log(`  预热 ${warmedRows.length} 篇 / ${totalChars.toLocaleString('en
 const status = await call('/ima-kb/api/warm-status')
 check('/warm-status 认全部已缓存', status.body.running === false && status.body.cached === rows.length && status.body.failed === 0, JSON.stringify(status.body))
 
-const cacheFiles = existsSync(cacheDir) ? readdirSync(cacheDir).filter((name) => name.endsWith('.json')) : []
-check('磁盘缓存已写入', cacheFiles.length === 1, JSON.stringify(cacheFiles))
-// v1.5.0：磁盘缓存里要同时有「整份笔记列表」和每篇的 modify_time，重启才能增量预热。
-const cachePayload = cacheFiles.length === 1
-  ? JSON.parse(readFileSync(join(cacheDir, cacheFiles[0]), 'utf8'))
-  : null
-check('磁盘缓存 v3 结构', cachePayload !== null && cachePayload.version === 3 && Array.isArray(cachePayload.list && cachePayload.list.notes), `version=${cachePayload && cachePayload.version}`)
-const cachedEntries = cachePayload === null ? [] : Object.values(cachePayload.notes || {})
+// v2.7.0：一篇笔记一个文件（content-<key>/n-<id>.json + meta.json），不再重写整份 JSON。
+const contentEntry = existsSync(cacheDir) ? readdirSync(cacheDir).find((name) => name.startsWith('content-')) : undefined
+const contentPath = contentEntry === undefined ? '' : join(cacheDir, contentEntry)
+const cacheFiles = contentPath !== '' && statSync(contentPath).isDirectory() ? readdirSync(contentPath) : []
+const noteFiles = cacheFiles.filter((name) => name.startsWith('n-'))
+check('磁盘缓存已写入（一篇一个文件）', noteFiles.length === rows.length, `${noteFiles.length} files vs ${rows.length} notes`)
+const cacheMeta = cacheFiles.includes('meta.json') ? JSON.parse(readFileSync(join(contentPath, 'meta.json'), 'utf8')) : null
+check('磁盘缓存 v4 结构', cacheMeta !== null && cacheMeta.version === 4 && Array.isArray(cacheMeta.list && cacheMeta.list.notes), `version=${cacheMeta && cacheMeta.version}`)
+const cachedEntries = noteFiles.map((name) => { try { return JSON.parse(readFileSync(join(contentPath, name), 'utf8')) } catch { return null } }).filter((entry) => entry !== null)
 const withModified = cachedEntries.filter((entry) => typeof entry.modified === 'number').length
-check('正文缓存带 modify_time', cachedEntries.length > 0 && withModified >= cachedEntries.length, `${withModified}/${cachedEntries.length}`)
-check('磁盘缓存带笔记列表', cachePayload !== null && cachePayload.list.notes.length === rows.length, `${cachePayload && cachePayload.list && cachePayload.list.notes.length} vs ${rows.length}`)
+check('正文缓存带 modify_time', cachedEntries.length > 0 && withModified === cachedEntries.length, `${withModified}/${cachedEntries.length}`)
+check('磁盘缓存带笔记列表', cacheMeta !== null && cacheMeta.list.notes.length === rows.length, `${cacheMeta && cacheMeta.list && cacheMeta.list.notes.length} vs ${rows.length}`)
 
 // v1.9.0：正文取自结构化格式（format=2）再转文本，必须保留段落换行；
 // 之前用 format=0，一篇 1708 字的笔记全文只有 2 个换行，阅读器里挤成一坨。
@@ -314,9 +315,8 @@ const refresh = await call('/ima-kb/api/refresh')
 check('/refresh 200', refresh.status === 200 && refresh.body.ok === true, JSON.stringify(refresh.body))
 // /refresh 清内存缓存和笔记正文缓存；个人知识库的本地快照（kb-*.json）按设计保留，
 // 要清它得显式调 kb-cache?clear=1。
-const afterRefreshFiles = existsSync(cacheDir) ? readdirSync(cacheDir).filter((name) => name.endsWith('.json')) : []
-const noteCacheFiles = afterRefreshFiles.filter((name) => name.startsWith('content-'))
-check('refresh 清掉笔记正文缓存', noteCacheFiles.length === 0, JSON.stringify(afterRefreshFiles))
+const afterRefreshNames = existsSync(cacheDir) ? readdirSync(cacheDir) : []
+check('refresh 清掉笔记正文缓存', !afterRefreshNames.some((name) => name.startsWith('content-')), JSON.stringify(afterRefreshNames))
 const notesAgain = await call('/ima-kb/api/notes')
 const stateAfter = await call('/ima-kb/api/state')
 check('refresh 后仍能重新翻页', (notesAgain.body.notes || []).length === stateAfter.body.noteCount, `${(notesAgain.body.notes || []).length} vs ${stateAfter.body.noteCount}`)

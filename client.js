@@ -110,7 +110,7 @@ window.__ModuleLoader__.load({
         notesCacheStats: (n, size) => `已缓存 ${n} 篇 · ${size}`,
         notesCachePartial: (done, total) => `已缓存 ${done}/${total} 篇`,
         cacheMissing: (n) => `本地还有 ${n} 篇正文没缓存，这次只搜了已缓存的部分；点笔记栏顶部的「⋯ → 更新缓存」补齐。`,
-        kbCacheWarming: (stage, done, total) => stage === 'text' ? `正在缓存正文 ${done}/${total}` : '正在缓存目录…',
+        kbCacheWarming: (stage, done, total) => stage === 'text' ? `正在缓存正文 ${done}/${total}` : stage === 'pdf' ? `正在缓存 PDF ${done}/${total}` : '正在缓存目录…',
         kbCacheDone: (files, texts, failed) => `已缓存 ${files} 个文件${texts > 0 ? `、${texts} 篇正文` : ''}${failed > 0 ? `，${failed} 篇失败` : ''}`,
         kbCacheShared: '订阅 / 加入的知识库不做本地缓存，按需在线读取。',
         kbDownload: '下载原文',
@@ -210,7 +210,7 @@ window.__ModuleLoader__.load({
         notesCacheStats: (n, size) => `${n} notes · ${size}`,
         notesCachePartial: (done, total) => `${done}/${total} notes cached`,
         cacheMissing: (n) => `${n} notes have no cached text yet, so this search covered the cached ones only. Use “⋯ → Update cache” above the note list.`,
-        kbCacheWarming: (stage, done, total) => stage === 'text' ? `Caching texts ${done}/${total}` : 'Caching folders…',
+        kbCacheWarming: (stage, done, total) => stage === 'text' ? `Caching texts ${done}/${total}` : stage === 'pdf' ? `Caching PDFs ${done}/${total}` : 'Caching folders…',
         kbCacheDone: (files, texts, failed) => `Cached ${files} files${texts > 0 ? `, ${texts} texts` : ''}${failed > 0 ? `, ${failed} failed` : ''}`,
         kbCacheShared: 'Subscribed / joined spaces are not cached locally; they stay online-only.',
         kbDownload: 'Download original',
@@ -646,6 +646,9 @@ window.__ModuleLoader__.load({
       const [notesCacheMenu, setNotesCacheMenu] = React.useState(false)
       const [notesClearConfirm, setNotesClearConfirm] = React.useState(false)
       const [notesCacheBytes, setNotesCacheBytes] = React.useState(0)
+      /** 两个 ⋯ 菜单的 DOM 引用：键盘上下键要在里面移动焦点。 */
+      const kbCacheMenuRef = React.useRef(null)
+      const notesCacheMenuRef = React.useRef(null)
 
       const [kbQ, setKbQ] = React.useState(snap === null || typeof snap.kbQ !== 'string' ? '' : snap.kbQ)
       const [kbResults, setKbResults] = React.useState(snap === null ? null : snap.kbResults)
@@ -789,6 +792,13 @@ window.__ModuleLoader__.load({
             end: payload.end,
             anchor: typeof anchor === 'number' ? anchor : null,
           })
+          // 读了一篇就等于多缓存了一篇，顺手把「已缓存 N/M」刷新一下（本地 HTTP，很便宜）。
+          try {
+            const snapshot = await getJson(API + '/warm-status')
+            if (snapshot) setWarm(snapshot)
+          } catch {
+            // 进度只是展示，取不到不影响阅读。
+          }
           setRecent((current) => {
             const entry = { id: payload.id, title: payload.title, at: Date.now() }
             const next = [entry, ...current.filter((item) => item.id !== payload.id)].slice(0, RECENT_MAX)
@@ -1323,6 +1333,33 @@ window.__ModuleLoader__.load({
         return () => document.removeEventListener('mousedown', close)
       }, [notesCacheMenu])
 
+      /** 键盘：Esc 收起菜单；上下键在展开的菜单里挪焦点。 */
+      React.useEffect(() => {
+        if (!kbCacheMenu && !notesCacheMenu) return undefined
+        const onKeyDown = (event) => {
+          if (event.key === 'Escape') {
+            setKbCacheMenu(false)
+            setKbCacheConfirm(false)
+            setNotesCacheMenu(false)
+            setNotesClearConfirm(false)
+            return
+          }
+          if (event.key !== 'ArrowDown' && event.key !== 'ArrowUp') return
+          const root = kbCacheMenu ? kbCacheMenuRef.current : notesCacheMenuRef.current
+          if (root === null) return
+          const buttons = Array.from(root.querySelectorAll('button'))
+          if (buttons.length === 0) return
+          event.preventDefault()
+          const index = buttons.indexOf(document.activeElement)
+          const next = event.key === 'ArrowDown'
+            ? (index + 1) % buttons.length
+            : (index <= 0 ? buttons.length - 1 : index - 1)
+          buttons[next].focus()
+        }
+        document.addEventListener('keydown', onKeyDown)
+        return () => document.removeEventListener('keydown', onKeyDown)
+      }, [kbCacheMenu, notesCacheMenu])
+
 
       const runKbSearch = React.useCallback(async (value) => {
         const q = String(value || '').trim()
@@ -1408,7 +1445,7 @@ window.__ModuleLoader__.load({
                         : cacheEntry.snapshotAt > 0
                           ? t.kbCacheAt(formatSnapshot(cacheEntry.snapshotAt))
                             + ' · '
-                            + t.kbCacheStats(cacheEntry.files, cacheEntry.texts, formatBytes(kbCache === null ? 0 : kbCache.bytes))
+                            + t.kbCacheStats(cacheEntry.files, cacheEntry.texts, formatBytes(cacheEntry.bytes))
                           : t.kbCachePartial(cacheEntry.dirs),
                   ),
                   kbCacheBusy
@@ -1443,7 +1480,7 @@ window.__ModuleLoader__.load({
                 kbCacheMenu && !kbCacheBusy
                   ? h(
                       'div',
-                      { className: 'ima-kb-kbcache-menu', onMouseDown: (event) => event.stopPropagation() },
+                      { className: 'ima-kb-kbcache-menu', ref: kbCacheMenuRef, onMouseDown: (event) => event.stopPropagation() },
                       h(
                         'button',
                         {
@@ -1675,7 +1712,7 @@ window.__ModuleLoader__.load({
           notesCacheMenu && !warmRunning
             ? h(
                 'div',
-                { className: 'ima-kb-kbcache-menu', onMouseDown: (event) => event.stopPropagation() },
+                { className: 'ima-kb-kbcache-menu', ref: notesCacheMenuRef, onMouseDown: (event) => event.stopPropagation() },
                 h(
                   'button',
                   {

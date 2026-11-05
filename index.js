@@ -30,7 +30,7 @@
  *  - get_media_info → 拿到带签名的原文地址，由 /ima-kb/api/kb-raw 代理下载。
  */
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { createReadStream, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -138,6 +138,21 @@ export const Config = Schema.object({
     .max(50000)
     .default(2000)
     .description('单个个人知识库最多缓存多少个文件正文；超过就只缓存目录'),
+  kbCacheMaxMb: Schema.number()
+    .step(1)
+    .min(1)
+    .max(102400)
+    .default(512)
+    .description('个人知识库本地缓存的容量上限（MB）；超了按最久没用的先删'),
+  kbCachePdf: Schema.string()
+    .default('on')
+    .description("预热个人知识库时是否把 PDF 原件也存下来（离线也能看）；填 off 只存目录和文本"),
+  kbCacheMaxPdfMb: Schema.number()
+    .step(1)
+    .min(1)
+    .max(1024)
+    .default(20)
+    .description('单个 PDF 超过多少 MB 就不缓存了'),
 })
 
 const DEFAULT_CREDENTIALS_DIR = join(homedir(), '.config', 'ima')
@@ -199,7 +214,7 @@ const READ_LIMIT_DEFAULT = 6000
 const READ_LIMIT_MAX = 30000
 
 /** 磁盘缓存格式版本（v3 起正文是结构化格式转出的带换行文本）。 */
-const DISK_CACHE_VERSION = 3
+const DISK_CACHE_VERSION = 4
 
 /** 运行时设置；apply 时由 Loader 解析后的 Config 覆盖。 */
 const settings = {
@@ -217,6 +232,9 @@ const settings = {
   kbCacheTtlMs: 10080 * 60 * 1000,
   kbCacheText: 'on',
   kbCacheMaxFiles: 2000,
+  kbCacheMaxMb: 512,
+  kbCachePdf: 'on',
+  kbCacheMaxPdfMb: 20,
 }
 
 function nonEmptyString(value) {
@@ -249,6 +267,9 @@ function resolveSettings(raw) {
   settings.kbCacheTtlMs = clamp(config.kbCacheTtlMinutes ?? 10080, 1, 525600) * 60 * 1000
   settings.kbCacheText = config.kbCacheText === 'off' ? 'off' : 'on'
   settings.kbCacheMaxFiles = clamp(config.kbCacheMaxFiles ?? 2000, 1, 50000)
+  settings.kbCacheMaxMb = clamp(config.kbCacheMaxMb ?? 512, 1, 102400)
+  settings.kbCachePdf = config.kbCachePdf === 'off' ? 'off' : 'on'
+  settings.kbCacheMaxPdfMb = clamp(config.kbCacheMaxPdfMb ?? 20, 1, 1024)
   settings.titleFilter = String(config.titleFilter ?? '')
     .split(/[,，]/)
     .map((term) => term.trim())
@@ -478,19 +499,42 @@ const noteInflight = new Map()
 let diskLoaded = false
 let diskSaveTimer
 let diskFile
+let diskDir
+/** 需要写盘的笔记 id：以前每次落盘要把 71 篇的整份 JSON 重写一遍，现在只写变过的。 */
+const dirtyNotes = new Set()
 
-function cacheFile() {
+/** baseUrl + clientId 的短 hash，笔记缓存和知识库缓存共用这个 key。 */
+function cacheKey() {
   if (settings.cacheDir === '') return ''
-  if (diskFile !== undefined) return diskFile
   let clientId = ''
   try {
     clientId = credentialState().clientId
   } catch {
     clientId = ''
   }
-  const key = createHash('sha256').update(`${settings.baseUrl}|${clientId}`).digest('hex').slice(0, 16)
-  diskFile = join(settings.cacheDir, `content-${key}.json`)
+  return createHash('sha256').update(settings.baseUrl + '|' + clientId).digest('hex').slice(0, 16)
+}
+
+/** 旧版单文件路径：只用于迁移老缓存、以及 /state 统计占用。 */
+function cacheFile() {
+  if (settings.cacheDir === '') return ''
+  if (diskFile !== undefined) return diskFile
+  const key = cacheKey()
+  diskFile = key === '' ? '' : join(settings.cacheDir, 'content-' + key + '.json')
   return diskFile
+}
+
+/** v4：一篇笔记一个文件，目录是 cacheDir/content-<key>/。 */
+function cacheDirPath() {
+  if (settings.cacheDir === '') return ''
+  if (diskDir !== undefined) return diskDir
+  const key = cacheKey()
+  diskDir = key === '' ? '' : join(settings.cacheDir, 'content-' + key)
+  return diskDir
+}
+
+function noteFilePath(dir, noteId) {
+  return join(dir, 'n-' + noteId + '.json')
 }
 
 function freshContent(noteId) {
@@ -499,75 +543,196 @@ function freshContent(noteId) {
   return contentCache.get(noteId)
 }
 
-/** 首次用到正文时把磁盘缓存读回内存（过期条目直接丢，笔记列表也一起恢复）。 */
-function ensureDiskLoaded() {
-  if (diskLoaded) return
-  diskLoaded = true
-  const file = cacheFile()
-  if (file === '') return
+function readDiskMeta(dir) {
+  try {
+    const payload = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'))
+    if (payload === null || typeof payload !== 'object') return null
+    if (payload.version !== DISK_CACHE_VERSION || payload.baseUrl !== settings.baseUrl) return null
+    return payload
+  } catch {
+    return null
+  }
+}
+
+function restoreNoteList(list) {
+  if (list === null || typeof list !== 'object') return
+  if (!Array.isArray(list.notes) || list.notes.length === 0) return
+  const at = Number(list.at) || 0
+  if (Date.now() - at >= LIST_TTL_MS * 12) return
+  notesCache = { at, notes: list.notes, truncated: Boolean(list.truncated) }
+}
+
+function putContent(noteId, entry) {
+  contentCache.set(noteId, entry)
+}
+
+/** v3 的单文件缓存读进来，写成 v4 目录，然后删掉老文件。 */
+function migrateLegacyCache(dir) {
+  const legacy = cacheFile()
+  if (legacy === '' || !existsSync(legacy)) return false
   let payload
   try {
-    payload = JSON.parse(readFileSync(file, 'utf8'))
+    payload = JSON.parse(readFileSync(legacy, 'utf8'))
   } catch {
-    return
+    return false
   }
-  if (payload === null || typeof payload !== 'object') return
-  if (payload.version !== DISK_CACHE_VERSION || payload.baseUrl !== settings.baseUrl) return
+  if (payload === null || typeof payload !== 'object' || payload.baseUrl !== settings.baseUrl) return false
   const notes = payload.notes !== null && typeof payload.notes === 'object' ? payload.notes : {}
   for (const [noteId, entry] of Object.entries(notes)) {
     if (entry === null || typeof entry !== 'object' || typeof entry.content !== 'string') continue
     const at = Number(entry.at) || 0
     if (Date.now() - at >= settings.contentTtlMs) continue
-    contentCache.set(noteId, {
+    putContent(noteId, {
+      content: entry.content,
+      at,
+      modified: typeof entry.modified === 'number' ? entry.modified : undefined,
+    })
+    dirtyNotes.add(noteId)
+  }
+  restoreNoteList(payload.list)
+  writeDiskCache()
+  try {
+    rmSync(legacy, { force: true })
+  } catch {
+    // 老文件删不掉也不影响，下次再试。
+  }
+  return true
+}
+
+/** 首次用到正文时把磁盘缓存读回内存（过期条目直接丢，笔记列表也一起恢复）。 */
+function ensureDiskLoaded() {
+  if (diskLoaded) return
+  diskLoaded = true
+  const dir = cacheDirPath()
+  if (dir === '') return
+  const meta = readDiskMeta(dir)
+  if (meta === null) {
+    migrateLegacyCache(dir)
+    return
+  }
+  restoreNoteList(meta.list)
+  let names = []
+  try {
+    names = readdirSync(dir)
+  } catch {
+    names = []
+  }
+  for (const name of names) {
+    if (!name.startsWith('n-') || !name.endsWith('.json')) continue
+    let entry
+    try {
+      entry = JSON.parse(readFileSync(join(dir, name), 'utf8'))
+    } catch {
+      continue
+    }
+    if (entry === null || typeof entry !== 'object' || typeof entry.content !== 'string') continue
+    const at = Number(entry.at) || 0
+    if (Date.now() - at >= settings.contentTtlMs) continue
+    const noteId = name.slice(2, -5)
+    putContent(noteId, {
       content: entry.content,
       at,
       modified: typeof entry.modified === 'number' ? entry.modified : undefined,
     })
   }
-  // 列表也落盘：重启后面板立即可用，预热只需补「变过的笔记」。
-  const list = payload.list !== null && typeof payload.list === 'object' ? payload.list : null
-  if (list !== null && Array.isArray(list.notes) && list.notes.length > 0) {
-    const at = Number(list.at) || 0
-    if (Date.now() - at < LIST_TTL_MS * 12) {
-      notesCache = { at, notes: list.notes, truncated: Boolean(list.truncated) }
+}
+
+/**
+ * 落盘：meta.json（列表 + 版本）总写；正文只写 dirtyNotes 里那些。
+ * 这样读一篇笔记只产生一个小文件写入，不再重写几 MB 的整份 JSON。
+ */
+function writeDiskCache() {
+  const dir = cacheDirPath()
+  if (dir === '') return
+  try {
+    mkdirSync(dir, { recursive: true })
+    const meta = JSON.stringify({
+      version: DISK_CACHE_VERSION,
+      baseUrl: settings.baseUrl,
+      savedAt: Date.now(),
+      list: notesCache === undefined
+        ? null
+        : { at: notesCache.at, truncated: notesCache.truncated === true, notes: notesCache.notes },
+    })
+    const metaTemp = join(dir, 'meta.json.tmp-' + process.pid)
+    writeFileSync(metaTemp, meta, 'utf8')
+    renameSync(metaTemp, join(dir, 'meta.json'))
+    for (const noteId of dirtyNotes) {
+      const entry = contentCache.get(noteId)
+      const target = noteFilePath(dir, noteId)
+      if (entry === undefined || Date.now() - entry.at >= settings.contentTtlMs) {
+        try {
+          rmSync(target, { force: true })
+        } catch {
+          // 删不掉就留着，下次再删。
+        }
+        continue
+      }
+      const body = JSON.stringify({
+        content: entry.content,
+        at: entry.at,
+        ...(typeof entry.modified === 'number' ? { modified: entry.modified } : {}),
+      })
+      const temp = target + '.tmp-' + process.pid
+      writeFileSync(temp, body, 'utf8')
+      renameSync(temp, target)
+    }
+    dirtyNotes.clear()
+  } catch {
+    // 写缓存失败不影响功能。
+  }
+}
+
+/** 删掉已经不在内存里（删笔记 / 换账号 / 过期）的正文文件。预热结束时跑一次。 */
+function pruneDiskCache() {
+  const dir = cacheDirPath()
+  if (dir === '') return
+  let names = []
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return
+  }
+  for (const name of names) {
+    if (!name.startsWith('n-') || !name.endsWith('.json')) continue
+    const noteId = name.slice(2, -5)
+    const entry = contentCache.get(noteId)
+    if (entry === undefined || Date.now() - entry.at >= settings.contentTtlMs) {
+      try {
+        rmSync(join(dir, name), { force: true })
+      } catch {
+        // 同上。
+      }
     }
   }
 }
 
-function writeDiskCache() {
-  const file = cacheFile()
-  if (file === '') return
-  const notes = {}
-  for (const [noteId, entry] of contentCache) {
-    if (Date.now() - entry.at >= settings.contentTtlMs) continue
-    notes[noteId] = {
-      content: entry.content,
-      at: entry.at,
-      ...(typeof entry.modified === 'number' ? { modified: entry.modified } : {}),
-    }
-  }
-  const list = notesCache === undefined
-    ? null
-    : { at: notesCache.at, truncated: notesCache.truncated === true, notes: notesCache.notes }
-  const payload = JSON.stringify({
-    version: DISK_CACHE_VERSION,
-    baseUrl: settings.baseUrl,
-    savedAt: Date.now(),
-    notes,
-    list,
-  })
-  try {
-    mkdirSync(settings.cacheDir, { recursive: true })
-    const temp = `${file}.tmp-${process.pid}`
-    writeFileSync(temp, payload, 'utf8')
-    renameSync(temp, file)
-  } catch {
+/** 读取任意 .json 缓存文件的总字节数（/state 用来显示占用）。 */
+function diskBytesOf(dir, legacy) {
+  let total = 0
+  if (dir !== '') {
+    let names = []
     try {
-      rmSync(`${file}.tmp-${process.pid}`, { force: true })
+      names = readdirSync(dir)
     } catch {
-      // 写缓存失败不影响功能。
+      names = []
+    }
+    for (const name of names) {
+      try {
+        total += statSync(join(dir, name)).size
+      } catch {
+        // 文件可能刚好被删。
+      }
     }
   }
+  if (legacy !== '') {
+    try {
+      total += statSync(legacy).size
+    } catch {
+      // 没有老文件就是 0。
+    }
+  }
+  return total
 }
 
 /** 预热期间不反复落盘：最后 flushDiskSave 一次写完就够了。 */
@@ -590,16 +755,27 @@ function flushDiskSave() {
     diskSaveTimer = undefined
   }
   writeDiskCache()
+  pruneDiskCache()
 }
 
 function removeDiskCache() {
-  const file = cacheFile()
-  if (file === '') return
-  try {
-    rmSync(file, { force: true })
-  } catch {
-    // 删不掉就算了，内存缓存已经清空。
+  const dir = cacheDirPath()
+  if (dir !== '') {
+    try {
+      rmSync(dir, { recursive: true, force: true })
+    } catch {
+      // 删不掉就算了，内存缓存已经清空。
+    }
   }
+  const legacy = cacheFile()
+  if (legacy !== '') {
+    try {
+      rmSync(legacy, { force: true })
+    } catch {
+      // 同上。
+    }
+  }
+  dirtyNotes.clear()
 }
 
 function cachedChars(noteId) {
@@ -841,6 +1017,7 @@ async function fetchNoteContent(noteId, priority, modified) {
     ...(typeof modified === 'number' ? { modified } : {}),
   }
   contentCache.set(noteId, entry)
+  dirtyNotes.add(noteId)
   scheduleDiskSave()
   return entry
 }
@@ -914,7 +1091,10 @@ function warmAll() {
       // 否则磁盘缓存会一直带着这些孤儿条目。
       const liveIds = new Set(notes.map((note) => note.id))
       for (const noteId of Array.from(contentCache.keys())) {
-        if (!liveIds.has(noteId)) contentCache.delete(noteId)
+        if (!liveIds.has(noteId)) {
+          contentCache.delete(noteId)
+          dirtyNotes.add(noteId)
+        }
       }
     } finally {
       saveSuppressed -= 1
@@ -1276,21 +1456,67 @@ async function listKbDirectory(kbId, folderId, cursor) {
 }
 
 /** 在知识库里按文件名/文件夹名检索（ima 该接口不搜正文）。 */
-async function searchKbFiles(kbId, query) {
-  const data = await imaApi('openapi/wiki/v1/search_knowledge', {
-    knowledge_base_id: kbId,
-    query,
-    cursor: '',
-  })
-  const items = []
-  for (const row of Array.isArray(data?.info_list) ? data.info_list : []) {
-    const item = normalizeKbItem(row)
-    if (item !== null) {
-      item.snippet = typeof row.highlight_content === 'string' ? row.highlight_content.slice(0, 300) : ''
-      items.push(item)
+/**
+ * 断网兜底：在本地缓存的目录树里按文件名过滤。ima 的这个接口本来也只匹配标题，
+ * 所以离线时用同一份快照过滤，结果语义一致。
+ */
+function localKbFiles(kbId, query) {
+  const q = String(query ?? '').trim().toLowerCase()
+  if (q === '') return []
+  ensureKbDiskLoaded()
+  const seen = new Set()
+  const out = []
+  const push = (items) => {
+    if (!Array.isArray(items)) return
+    for (const item of items) {
+      if (item === null || typeof item !== 'object' || seen.has(item.mediaId)) continue
+      if (!String(item.title).toLowerCase().includes(q)) continue
+      seen.add(item.mediaId)
+      out.push({ ...item, snippet: '' })
     }
   }
-  return items
+  const folders = kbDisk === null ? undefined : kbDisk.dirs[kbId]
+  if (folders !== undefined) {
+    for (const entry of Object.values(folders)) {
+      const value = entry !== null && typeof entry === 'object' ? entry.value : undefined
+      if (value !== undefined) push(value.items)
+    }
+  }
+  for (const [dirKey, entry] of kbDirCache) {
+    if (dirKey.split('|')[0] !== kbId) continue
+    const value = entry !== null && typeof entry === 'object' ? entry.value : undefined
+    if (value !== undefined) push(value.items)
+  }
+  return out.slice(0, 50)
+}
+
+/**
+ * 按文件名/文件夹名检索。在线优先；网络失败时退回本地快照，并标明来源。
+ * @returns {{items: object[], source: 'server'|'local', error: string}}
+ */
+async function searchKbFiles(kbId, query) {
+  try {
+    const data = await imaApi('openapi/wiki/v1/search_knowledge', {
+      knowledge_base_id: kbId,
+      query,
+      cursor: '',
+    })
+    const items = []
+    for (const row of Array.isArray(data?.info_list) ? data.info_list : []) {
+      const item = normalizeKbItem(row)
+      if (item !== null) {
+        item.snippet = typeof row.highlight_content === 'string' ? row.highlight_content.slice(0, 300) : ''
+        items.push(item)
+      }
+    }
+    return { items, source: 'server', error: '' }
+  } catch (error) {
+    const local = localKbFiles(kbId, query)
+    if (local.length > 0) {
+      return { items: local, source: 'local', error: error instanceof Error ? error.message : String(error) }
+    }
+    throw error
+  }
 }
 
 /** 取文件原文的签名地址（带有效期的签名，不缓存）。 */
@@ -1444,6 +1670,21 @@ async function kbFileText(mediaId, title) {
     kbTextCache.set(mediaId, { at: Date.now(), value: fromDisk })
     return fromDisk
   }
+  // PDF 有本地副本时不需要联网：直接给内嵌地址（/kb-raw 会发本地文件）。
+  if (inferFileKind(title, 0) === 'pdf') {
+    const localPdf = pdfCachePath(mediaId)
+    if (localPdf !== '' && existsSync(localPdf)) {
+      const value = {
+        kind: 'pdf',
+        text: '',
+        chars: 0,
+        truncated: false,
+        inlineUrl: '/ima-kb/api/kb-raw?media_id=' + encodeURIComponent(mediaId) + '&inline=1',
+      }
+      kbTextCache.set(mediaId, { at: Date.now(), value })
+      return value
+    }
+  }
   const info = await mediaInfo(mediaId)
   const kind = inferFileKind(title, info.mediaType)
   if (kind === 'pdf') {
@@ -1542,6 +1783,121 @@ function kbCacheFile() {
   return join(settings.cacheDir, 'kb-' + key + '.json')
 }
 
+
+/** PDF 原件的缓存目录（只给个人知识库用）。 */
+function pdfCacheDir() {
+  if (settings.cacheDir === '') return ''
+  return join(settings.cacheDir, 'pdf')
+}
+
+function pdfCachePath(mediaId) {
+  const dir = pdfCacheDir()
+  return dir === '' ? '' : join(dir, 'p-' + mediaId + '.bin')
+}
+
+/** 统计一个目录下所有文件的总字节（不存在就 0）。 */
+function dirBytes(dir) {
+  if (dir === '') return 0
+  let total = 0
+  let names = []
+  try {
+    names = readdirSync(dir)
+  } catch {
+    return 0
+  }
+  for (const name of names) {
+    try {
+      total += statSync(join(dir, name)).size
+    } catch {
+      // 文件可能刚好被删。
+    }
+  }
+  return total
+}
+
+function pdfBytes(mediaId) {
+  const target = pdfCachePath(mediaId)
+  if (target === '') return 0
+  try {
+    return statSync(target).size
+  } catch {
+    return 0
+  }
+}
+
+/** 整个个人库缓存（kb-*.json + pdf 目录）当前占多少字节。 */
+function kbCacheTotalBytes() {
+  let total = 0
+  const file = kbCacheFile()
+  if (file !== '') {
+    try {
+      total += statSync(file).size
+    } catch {
+      // 还没有缓存文件。
+    }
+  }
+  total += dirBytes(pdfCacheDir())
+  return total
+}
+
+let enforcingKbCap = false
+
+/** 超过容量上限就按「最久没用的」淘汰：先正文，再 PDF 原件。 */
+function enforceKbCacheCap() {
+  if (enforcingKbCap) return
+  const cap = settings.kbCacheMaxMb * 1024 * 1024
+  if (cap <= 0) return
+  let total = kbCacheTotalBytes()
+  if (total <= cap) return
+  enforcingKbCap = true
+  try {
+    ensureKbDiskLoaded()
+    if (kbDisk !== null) {
+      const texts = Object.entries(kbDisk.texts ?? {})
+        .sort((left, right) => (Number(left[1].at) || 0) - (Number(right[1].at) || 0))
+      let changed = false
+      for (const [mediaId, entry] of texts) {
+        if (total <= cap) break
+        total -= JSON.stringify(entry).length
+        delete kbDisk.texts[mediaId]
+        changed = true
+      }
+      if (changed) writeKbDisk()
+    }
+    if (total > cap) {
+      const dir = pdfCacheDir()
+      let names = []
+      try {
+        names = readdirSync(dir)
+      } catch {
+        names = []
+      }
+      const sorted = names.map((name) => {
+        let at = 0
+        let size = 0
+        try {
+          const info = statSync(join(dir, name))
+          at = info.mtimeMs
+          size = info.size
+        } catch {
+          // 读不到就当 0。
+        }
+        return { name, at, size }
+      }).sort((left, right) => left.at - right.at)
+      for (const item of sorted) {
+        if (total <= cap) break
+        try {
+          rmSync(join(dir, item.name), { force: true })
+        } catch {
+          // 删不掉就下次再删。
+        }
+        total -= item.size
+      }
+    }
+  } finally {
+    enforcingKbCap = false
+  }
+}
 function emptyKbDisk() {
   return { version: KB_DISK_VERSION, baseUrl: settings.baseUrl, savedAt: 0, list: undefined, dirs: {}, texts: {}, snaps: {} }
 }
@@ -1634,6 +1990,7 @@ function flushKbSave() {
     kbDiskTimer = undefined
   }
   writeKbDisk()
+  enforceKbCacheCap()
 }
 
 function resetKbDisk() {
@@ -1755,8 +2112,48 @@ function resetKbWarmState() {
   Object.assign(kbWarmState, { running: false, kbId: '', kbName: '', stage: '', total: 0, done: 0, failed: 0, folderCount: 0, fileCount: 0, startedAt: 0, finishedAt: 0 })
 }
 
+/** 把一个 PDF 原件下载到本地（离线看用）；超过 kbCacheMaxPdfMb 就放弃。 */
+async function cachePdfFile(mediaId) {
+  const target = pdfCachePath(mediaId)
+  if (target === '') return false
+  if (existsSync(target)) return true
+  const info = await mediaInfo(mediaId)
+  if (info.url === '') return false
+  const limit = settings.kbCacheMaxPdfMb * 1024 * 1024
+  let response
+  try {
+    response = await fetch(info.url, { headers: info.headers, signal: AbortSignal.timeout(120000) })
+  } catch {
+    return false
+  }
+  if (!response.ok || response.body === null) return false
+  const declared = Number(response.headers.get('content-length') ?? 0)
+  if (Number.isFinite(declared) && declared > limit) return false
+  const chunks = []
+  let received = 0
+  for await (const chunk of response.body) {
+    received += chunk.length
+    if (received > limit) return false
+    chunks.push(Buffer.from(chunk))
+  }
+  try {
+    mkdirSync(pdfCacheDir(), { recursive: true })
+    const temp = target + '.tmp-' + process.pid
+    writeFileSync(temp, Buffer.concat(chunks))
+    renameSync(temp, target)
+    return true
+  } catch {
+    try {
+      rmSync(target + '.tmp-' + process.pid, { force: true })
+    } catch {
+      // 写不进去就算了，在线看也一样。
+    }
+    return false
+  }
+}
+
 /**
- * 把一个个人知识库整棵缓存下来：先逐层翻页拉目录，再（默认）把 md/docx/txt 的正文取回。
+ * 把一个个人知识库整棵缓存下来：先逐层翻页拉目录，再拉 md/docx/txt 正文，最后（可选）存 PDF 原件。
  * 订阅 / 加入的库直接拒绝——它们仍然按原来的方式在线读。
  */
 function warmPersonalKb(kbId) {
@@ -1813,21 +2210,46 @@ function warmPersonalKb(kbId) {
         }
         kbWarmState.done += 1
       }
+      // 可选：PDF 原件也存本地，断网时 iframe 仍能打开。
+      const pdfTargets = settings.kbCachePdf === 'on'
+        ? files.filter((item) => inferFileKind(item.title, item.type) === 'pdf').slice(0, settings.kbCacheMaxFiles)
+        : []
+      let cachedPdfs = 0
+      if (pdfTargets.length > 0) {
+        kbWarmState.stage = 'pdf'
+        kbWarmState.total = pdfTargets.length
+        kbWarmState.done = 0
+        for (const item of pdfTargets) {
+          try {
+            if (await cachePdfFile(item.mediaId)) cachedPdfs += 1
+          } catch {
+            failed += 1
+          }
+          kbWarmState.done += 1
+        }
+      }
       kbWarmState.failed = failed
       if (kbDisk !== null) {
         kbDisk.snaps = kbDisk.snaps ?? {}
-        kbDisk.snaps[kbId] = { at: Date.now(), folders: kbWarmState.folderCount, files: files.length, texts: cachedTexts }
-      }
-      let bytes = 0
-      const cachePath = kbCacheFile()
-      if (cachePath !== '') {
-        try {
-          bytes = statSync(cachePath).size
-        } catch {
-          bytes = 0
+        kbDisk.snaps[kbId] = {
+          at: Date.now(),
+          folders: kbWarmState.folderCount,
+          files: files.length,
+          texts: cachedTexts,
+          pdfs: cachedPdfs,
         }
       }
-      return { kbId, name: kb.name, folders: kbWarmState.folderCount, files: files.length, texts: cachedTexts, failed, bytes }
+      enforceKbCacheCap()
+      return {
+        kbId,
+        name: kb.name,
+        folders: kbWarmState.folderCount,
+        files: files.length,
+        texts: cachedTexts,
+        pdfs: cachedPdfs,
+        failed,
+        bytes: kbCacheTotalBytes(),
+      }
     } finally {
       kbSaveSuppressed -= 1
       flushKbSave()
@@ -1871,10 +2293,36 @@ function kbCacheStatus() {
     kbs: source.map((kb) => {
       const snap = snaps[kb.id] !== null && typeof snaps[kb.id] === 'object' ? snaps[kb.id] : undefined
       const folders = kbDisk === null ? undefined : kbDisk.dirs[kb.id]
+      const textMap = kbDisk === null ? undefined : kbDisk.texts
       let dirs = 0
+      let bytes = 0
+      let texts = 0
+      let pdfs = 0
+      const mediaIds = new Set()
       if (folders !== undefined) {
         for (const entry of Object.values(folders)) {
-          if (kbFresh(entry)) dirs += 1
+          if (!kbFresh(entry)) continue
+          dirs += 1
+          bytes += JSON.stringify(entry).length
+          const items = entry !== null && typeof entry === 'object' && entry.value !== null && typeof entry.value === 'object' ? entry.value.items : undefined
+          if (Array.isArray(items)) {
+            for (const item of items) mediaIds.add(item.mediaId)
+          }
+        }
+      }
+      if (textMap !== undefined) {
+        for (const mediaId of mediaIds) {
+          const entry = textMap[mediaId]
+          if (entry === undefined || !kbFresh(entry)) continue
+          texts += 1
+          bytes += JSON.stringify(entry).length
+        }
+      }
+      for (const mediaId of mediaIds) {
+        const size = pdfBytes(mediaId)
+        if (size > 0) {
+          pdfs += 1
+          bytes += size
         }
       }
       // 目录过期（dirs=0）或只预热了一半（没有 snap）时，别把旧的快照数字报给面板，
@@ -1887,10 +2335,13 @@ function kbCacheStatus() {
         personal: isPersonalKb(kb),
         dirs,
         cached: live,
+        bytes,
+        pdfs,
+        texts,
         snapshotAt: useSnap ? (Number(snap.at) || 0) : 0,
         folders: useSnap ? (Number(snap.folders) || 0) : 0,
         files: useSnap ? (Number(snap.files) || 0) : 0,
-        texts: useSnap ? (Number(snap.texts) || 0) : 0,
+        textsAtWarm: useSnap ? (Number(snap.texts) || 0) : 0,
       }
     }),
   }
@@ -1905,6 +2356,14 @@ function clearKbCache() {
       rmSync(file, { force: true })
     } catch {
       // 删不掉就算了，内存已经清了。
+    }
+  }
+  const pdfDir = pdfCacheDir()
+  if (pdfDir !== '') {
+    try {
+      rmSync(pdfDir, { recursive: true, force: true })
+    } catch {
+      // 删不掉就算了。
     }
   }
   kbDirCache.clear()
@@ -1970,7 +2429,7 @@ async function findKbFileForTitle(title) {
   const query = wanted.replace(/\s+/g, ' ').slice(0, 60)
   for (const kb of targets) {
     try {
-      const items = await searchKbFiles(kb.id, query)
+      const { items } = await searchKbFiles(kb.id, query)
       if (items.length === 0) continue
       const clean = (value) => String(value || '').replace(/\.(md|markdown|docx|pdf|txt)$/i, '').replace(/\s+/g, '').trim()
       const best = items.find((item) => !item.folder && clean(item.title) === clean(wanted))
@@ -2264,13 +2723,17 @@ function registerTools(ctx) {
       const query = typeof args?.query === 'string' ? args.query.trim() : ''
       if (kbId === '') return 'kb_id 不能为空。先用 kb_space_list 看有哪些知识库。'
       if (query === '') return 'query 不能为空。'
-      const items = await searchKbFiles(kbId, query)
+      const found = await searchKbFiles(kbId, query)
+      const items = found.items
       if (items.length === 0) {
         return `知识库 ${kbId} 里没有文件名含「${query}」的内容。\n注意：这个接口只匹配文件名/文件夹名，不搜正文；正文请用 kb_search。`
       }
       const limit = clamp(args?.limit ?? 20, 1, 50)
       const shown = items.slice(0, limit)
-      const lines = [`文件名命中 ${shown.length} 条${items.length > limit ? `（共 ${items.length} 条，已截断）` : ''}：`, '']
+      const lines = found.source === 'local'
+        ? ['（ima 接口暂时连不上，下面是本地快照里的文件名匹配）', '']
+        : []
+      lines.push(`文件名命中 ${shown.length} 条${items.length > limit ? `（共 ${items.length} 条，已截断）` : ''}：`, '')
       for (const item of shown) {
         lines.push(`- [${item.folder ? '文件夹' : item.typeLabel}] ${item.title}`)
         lines.push(`  media_id: ${item.mediaId}`)
@@ -2283,6 +2746,46 @@ function registerTools(ctx) {
 }
 
 // ── HTTP 接口（面板用） ──────────────────────────────────────────────────
+/** 直接把本地缓存文件发给浏览器；支持 Range，PDF 内嵌查看才能拖进度条。 */
+function serveLocalFile(res, req, filePath, contentType, title, inline) {
+  let size = 0
+  try {
+    size = statSync(filePath).size
+  } catch {
+    sendJson(res, 500, { error: '本地缓存读取失败' })
+    return
+  }
+  const headers = {
+    'content-type': contentType,
+    'cache-control': 'no-store',
+    'accept-ranges': 'bytes',
+    'content-length': String(size),
+  }
+  if (!inline) headers['content-disposition'] = "attachment; filename*=UTF-8''" + encodeURIComponent(title)
+  const range = req.headers.range
+  if (typeof range === 'string') {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(range.trim())
+    if (match !== null) {
+      const startRaw = match[1]
+      const endRaw = match[2]
+      const start = startRaw === '' ? Math.max(0, size - Number(endRaw)) : Number(startRaw)
+      const end = startRaw === '' ? size - 1 : (endRaw === '' ? size - 1 : Math.min(size - 1, Number(endRaw)))
+      if (Number.isFinite(start) && Number.isFinite(end) && start <= end && start < size) {
+        headers['content-range'] = 'bytes ' + start + '-' + end + '/' + size
+        headers['content-length'] = String(end - start + 1)
+        res.writeHead(206, headers)
+        createReadStream(filePath, { start, end }).pipe(res)
+        return
+      }
+      res.writeHead(416, { 'content-range': 'bytes */' + size })
+      res.end()
+      return
+    }
+  }
+  res.writeHead(200, headers)
+  createReadStream(filePath).pipe(res)
+}
+
 function sendJson(res, status, value) {
   const body = JSON.stringify(value)
   res.writeHead(status, {
@@ -2371,16 +2874,9 @@ function registerRoutes(ctx) {
           titleFilter: settings.titleFilter,
           noteCount,
           truncated,
-          cacheFile: cacheFile(),
-          cacheBytes: (() => {
-            const path = cacheFile()
-            if (path === '') return 0
-            try {
-              return statSync(path).size
-            } catch {
-              return 0
-            }
-          })(),
+          notesCacheDir: cacheDirPath(),
+          notesCacheFile: cacheFile(),
+          cacheBytes: diskBytesOf(cacheDirPath(), cacheFile()),
           warm: warmSnapshot(),
         })
         return
@@ -2537,7 +3033,7 @@ function registerRoutes(ctx) {
           sendJson(res, 200, { items: [] })
           return
         }
-        sendJson(res, 200, { items: await searchKbFiles(kbId, query) })
+        sendJson(res, 200, await searchKbFiles(kbId, query))
         return
       }
       if (route === 'kb-file') {
@@ -2547,7 +3043,25 @@ function registerRoutes(ctx) {
           sendJson(res, 400, { error: 'missing media_id' })
           return
         }
-        const info = await mediaInfo(mediaId)
+        let info
+        try {
+          info = await mediaInfo(mediaId)
+        } catch (error) {
+          const localPdf = pdfCachePath(mediaId)
+          if (localPdf !== '' && existsSync(localPdf)) {
+            sendJson(res, 200, {
+              mediaId,
+              type: 1,
+              typeLabel: 'PDF',
+              kind: 'pdf',
+              readable: true,
+              downloadable: true,
+              cached: true,
+            })
+            return
+          }
+          throw error
+        }
         const kind = inferFileKind(title, info.mediaType)
         sendJson(res, 200, {
           mediaId,
@@ -2555,7 +3069,8 @@ function registerRoutes(ctx) {
           typeLabel: fileTypeLabel(title, info.mediaType),
           kind,
           readable: kind === 'markdown' || kind === 'docx' || kind === 'pdf' || kind === 'text',
-          downloadable: info.url !== '',
+          downloadable: info.url !== '' || (pdfCachePath(mediaId) !== '' && existsSync(pdfCachePath(mediaId))),
+          cached: pdfCachePath(mediaId) !== '' && existsSync(pdfCachePath(mediaId)),
         })
         return
       }
@@ -2588,6 +3103,12 @@ function registerRoutes(ctx) {
           return
         }
         try {
+          // 本地有 PDF 原件就直接发本地（断网也能看，还支持 Range）。
+          const localPdf = pdfCachePath(mediaId)
+          if (localPdf !== '' && existsSync(localPdf)) {
+            serveLocalFile(res, req, localPdf, 'application/pdf', url.searchParams.get('title') ?? 'file.pdf', inline)
+            return
+          }
           const info = await mediaInfo(mediaId)
           if (info.url === '') {
             sendJson(res, 404, { error: 'no downloadable url' })
