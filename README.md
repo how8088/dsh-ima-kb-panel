@@ -103,11 +103,11 @@ plugin_manager(action="install_bundle", target="<本仓库目录的绝对路径>
 | 东西 | 怎么弄 |
 |---|---|
 | ima 凭证 | 把 `~/.config/ima/client_id` 与 `api_key` 复制到新电脑同路径（**绝不要进仓库**） |
-| 两个技能 | 把本仓库 `skills/market-research/`、`skills/ima-kb/` 复制到 `~/.dsh/skills/` |
+| 两个技能 | **v2.2.0 起插件启动时会自动装到 `~/.dsh/skills/`（已存在不覆盖）**，无需手动；想手动就复制本仓库 `skills/` 过去 |
 | AGENTS.md 联动段 | 把本仓库 `docs/AGENTS-联动段.md` 的内容追加到 `~/.dsh/AGENTS.md` |
 | 通达信 MCP | 在新电脑的 DSH 里配置（token 只在你自己的机器上，仓库里没有） |
 
-> 为什么不把技能打进插件自动安装：技能是你会自己改的文档，插件自动覆盖会冲掉你的修改，所以放在仓库 `skills/` 里按需复制。
+> **技能现在随包自动安装**（v2.2.0 起）：插件启动时把 `market-research` / `ima-kb` 复制到 `~/.dsh/skills/`；目标已存在就跳过，**不会覆盖你改过的版本**。想更新技能就删掉旧目录再重启 DSH。
 
 ## 4. 装完怎么确认可用
 
@@ -157,9 +157,11 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
 | `clientIdEnv` | `IMA_CLIENT_ID` | client_id 读哪个环境变量 |
 | `apiKeyEnv` | `IMA_API_KEY` | api_key 读哪个环境变量 |
 | `maxNotes` | 500 | 最多收录多少篇（1–500，插件自动翻页） |
-| `contentTtlMinutes` | 360 | 正文缓存分钟数（内存 + 磁盘） |
+| `contentTtlMinutes` | 10080 | 磁盘正文最长保留期（分钟）；是否重取看 modify_time |
 | `cacheDir` | 空（= `~/.dsh/cache/ima-kb-panel`） | 正文缓存目录，填 `-` 表示不落盘 |
 | `titleFilter` | 空 | 只看标题含这些词的笔记，逗号分隔 |
+| `skillsDir` | 空（= `~/.dsh/skills`） | 随包技能安装到哪 |
+| `autoInstallSkills` | `on` | 启动时自动装随包技能（已存在跳过）；填 `off` 关闭 |
 
 ### 5.4 换了一台电脑，最短路径
 

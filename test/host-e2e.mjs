@@ -19,7 +19,7 @@
  *   4. 检索偏移量契约、工具输出、/refresh、磁盘缓存与冷启动命中。
  */
 import { createHash } from 'node:crypto'
-import { copyFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -27,10 +27,15 @@ const testDir = dirname(fileURLToPath(import.meta.url))
 const sourcePath = join(testDir, '..', 'index.js')
 const runnerDir = join(testDir, 'plugin')
 const cacheDir = join(testDir, 'cache')
+const skillsDir = join(testDir, 'skills-out')
 
 mkdirSync(runnerDir, { recursive: true })
 copyFileSync(sourcePath, join(runnerDir, 'index.js'))
+// 随包技能也要复制过去：插件按 import.meta.url 相对路径读它们。
+rmSync(join(runnerDir, 'skills'), { recursive: true, force: true })
+cpSync(join(testDir, '..', 'skills'), join(runnerDir, 'skills'), { recursive: true })
 rmSync(cacheDir, { recursive: true, force: true })
+rmSync(skillsDir, { recursive: true, force: true })
 
 const pluginPath = new URL('./plugin/index.js', import.meta.url)
 const pluginHash = createHash('sha256').update(readFileSync(sourcePath)).digest('hex').slice(0, 16)
@@ -106,7 +111,7 @@ console.log('=== boot 1（冷缓存）===')
 console.log('  plugin sha256[:16] =', pluginHash)
 const boot1 = makeContext()
 const mod = await import(pluginPath.href)
-mod.apply(boot1.ctx, { cacheDir })
+mod.apply(boot1.ctx, { cacheDir, skillsDir })
 
 check('export name', mod.name === 'ima-kb-panel', String(mod.name))
 check('export Config', mod.Config !== undefined, 'missing Config')
@@ -320,7 +325,7 @@ console.log('=== boot 2（暖缓存，模拟 DSH 重启）===')
 await call('/ima-kb/api/warm') // 把缓存重新灌满并落盘
 const boot2 = makeContext()
 const mod2 = await import(`${pluginPath.href}?boot=2`)
-mod2.apply(boot2.ctx, { cacheDir })
+mod2.apply(boot2.ctx, { cacheDir, skillsDir })
 const call2 = makeCaller(boot2.routes[0])
 // 知识库可能在跑测试期间被加笔记，所以 boot2 一律以它自己看到的列表为准。
 const notes2 = await call2('/ima-kb/api/notes')
@@ -335,8 +340,31 @@ check('boot2 全部有字数', warmRows2.length === rows2.length && warmRows2.ev
 const search2 = await call2('/ima-kb/api/search?q=' + encodeURIComponent(term) + '&limit=5')
 check('boot2 检索立即覆盖全部笔记', search2.body.notesScanned === rows2.length, `${search2.body.notesScanned} vs ${rows2.length}`)
 
+// ── 8. 随包技能自动安装（v2.2.0）──────────────────────────────────────
+console.log('=== bundled skills ===')
+const skillMarket = join(skillsDir, 'market-research', 'SKILL.md')
+const skillIma = join(skillsDir, 'ima-kb', 'SKILL.md')
+check('技能已自动安装', existsSync(skillMarket) && existsSync(skillIma), `${existsSync(skillMarket)}/${existsSync(skillIma)} @ ${skillsDir}`)
+const skillText = existsSync(skillMarket) ? readFileSync(skillMarket, 'utf8') : ''
+check('技能内容正确', skillText.includes('market-research') && skillText.includes('通达信'), skillText.slice(0, 60))
+// 用户改过的技能不允许被覆盖
+if (existsSync(skillMarket)) writeFileSync(skillMarket, 'USER-EDITED', 'utf8')
+const boot3 = makeContext()
+const mod3 = await import(`${pluginPath.href}?boot=3`)
+mod3.apply(boot3.ctx, { cacheDir, skillsDir })
+check('再次启动不覆盖用户修改', existsSync(skillMarket) && readFileSync(skillMarket, 'utf8') === 'USER-EDITED', readFileSync(skillMarket, 'utf8').slice(0, 30))
+// autoInstallSkills=off 时不安装
+const offSkillsDir = join(testDir, 'skills-off')
+rmSync(offSkillsDir, { recursive: true, force: true })
+const boot4 = makeContext()
+const mod4 = await import(`${pluginPath.href}?boot=4`)
+mod4.apply(boot4.ctx, { cacheDir, skillsDir: offSkillsDir, autoInstallSkills: 'off' })
+check('autoInstallSkills=off 不安装', !existsSync(join(offSkillsDir, 'market-research', 'SKILL.md')), offSkillsDir)
+
 rmSync(runnerDir, { recursive: true, force: true })
 rmSync(cacheDir, { recursive: true, force: true })
+rmSync(skillsDir, { recursive: true, force: true })
+rmSync(offSkillsDir, { recursive: true, force: true })
 
 console.log('\n' + (failures.length === 0 ? '全部通过' : `失败 ${failures.length} 项：\n` + failures.join('\n')))
 process.exitCode = failures.length === 0 ? 0 : 1

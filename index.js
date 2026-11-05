@@ -30,9 +30,10 @@
  *  - get_media_info → 拿到带签名的原文地址，由 /ima-kb/api/kb-raw 代理下载。
  */
 import { createHash } from 'node:crypto'
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 import zlib from 'node:zlib'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
@@ -72,6 +73,12 @@ export const Config = Schema.object({
   titleFilter: Schema.string()
     .default('')
     .description('只纳入标题包含这些词的笔记，多个用逗号分隔；留空表示全部'),
+  skillsDir: Schema.string()
+    .default('')
+    .description('把随包的两个技能（market-research / ima-kb）安装到哪个目录；留空用 ~/.dsh/skills'),
+  autoInstallSkills: Schema.string()
+    .default('on')
+    .description("插件启动时把随包的技能装到 skillsDir；已存在就不覆盖。填 off 关闭"),
 })
 
 const DEFAULT_CREDENTIALS_DIR = join(homedir(), '.config', 'ima')
@@ -138,6 +145,8 @@ const settings = {
   contentTtlMs: 10080 * 60 * 1000,
   cacheDir: DEFAULT_CACHE_DIR,
   titleFilter: [],
+  skillsDir: '',
+  autoInstallSkills: 'on',
 }
 
 function nonEmptyString(value) {
@@ -164,6 +173,8 @@ function resolveSettings(raw) {
   settings.contentTtlMs = clamp(config.contentTtlMinutes ?? 10080, 1, 10080) * 60 * 1000
   const rawCacheDir = nonEmptyString(config.cacheDir)
   settings.cacheDir = rawCacheDir === '-' ? '' : rawCacheDir || DEFAULT_CACHE_DIR
+  settings.skillsDir = nonEmptyString(config.skillsDir)
+  settings.autoInstallSkills = config.autoInstallSkills === 'off' ? 'off' : 'on'
   settings.titleFilter = String(config.titleFilter ?? '')
     .split(/[,，]/)
     .map((term) => term.trim())
@@ -175,6 +186,43 @@ function resolveSettings(raw) {
   diskLoaded = false
   resetWarmState()
   invalidateKbCaches()
+}
+
+/** 随包技能：安装时复制到 skillsDir，已存在则不覆盖（用户可能改过）。 */
+const BUNDLED_SKILLS = [
+  { name: 'market-research', file: 'skills/market-research/SKILL.md' },
+  { name: 'ima-kb', file: 'skills/ima-kb/SKILL.md' },
+]
+
+/**
+ * 把随包的技能装到本机 skills 目录（默认 ~/.dsh/skills）。
+ * 只在目标文件不存在时写入 —— 用户自己改过的技能不会被插件覆盖。
+ * @returns {{installed: string[], skipped: string[], target: string}}
+ */
+function installBundledSkills() {
+  const result = { installed: [], skipped: [], target: '' }
+  if (settings.autoInstallSkills !== 'on') return result
+  const baseDir = settings.skillsDir
+    || join(process.env.DSH_HOME || join(homedir(), '.dsh'), 'skills')
+  result.target = baseDir
+  for (const skill of BUNDLED_SKILLS) {
+    const targetDir = join(baseDir, skill.name)
+    const targetFile = join(targetDir, 'SKILL.md')
+    try {
+      if (existsSync(targetFile)) {
+        result.skipped.push(skill.name)
+        continue
+      }
+      const source = fileURLToPath(new URL(`./${skill.file}`, import.meta.url))
+      const content = readFileSync(source, 'utf8')
+      mkdirSync(targetDir, { recursive: true })
+      writeFileSync(targetFile, content, 'utf8')
+      result.installed.push(skill.name)
+    } catch {
+      // 技能安装失败不影响插件本身：静默跳过。
+    }
+  }
+  return result
 }
 
 function readTrim(filePath) {
@@ -518,7 +566,7 @@ function matchesTitleFilter(title) {
  * ima 的 list_note 单页上限 20，`cursor` 是「已经取过的条数」的十进制字符串，
  * 响应里用 `is_end` 标记是否到底。只取第一页会静默丢掉后面的笔记，所以这里翻页。
  */
-async function fetchAllNotes() {
+async function fetchAllNotes(priority = 0) {
   const notes = []
   let cursor = ''
   let fetched = 0
@@ -528,7 +576,7 @@ async function fetchAllNotes() {
       cursor,
       limit: PAGE_SIZE,
       sort_type: 0,
-    })
+    }, { priority })
     const rows = Array.isArray(data?.note_book_list) ? data.note_book_list : []
     for (const row of rows) {
       if (row === null || typeof row !== 'object' || !row.note_id) continue
@@ -575,7 +623,7 @@ async function listNotes() {
   if (notesCache !== undefined && now - notesCache.at < LIST_TTL_MS) return notesCache.notes
   if (notesCache !== undefined && now - notesCache.at < LIST_STALE_SERVE_MS) {
     if (refreshingNotes === undefined) {
-      refreshingNotes = fetchAllNotes().catch(() => {}).finally(() => { refreshingNotes = undefined })
+      refreshingNotes = fetchAllNotes(1).catch(() => {}).finally(() => { refreshingNotes = undefined })
     }
     return notesCache.notes
   }
@@ -1932,6 +1980,11 @@ function registerRoutes(ctx) {
 
 export function apply(ctx, config) {
   resolveSettings(config)
+  try {
+    installBundledSkills()
+  } catch {
+    // 技能安装是附加功能，失败不影响面板与工具。
+  }
   ctx.inject(['webServer'], (scoped) => {
     registerRoutes(scoped)
   })
