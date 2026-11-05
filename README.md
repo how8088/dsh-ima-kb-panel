@@ -90,7 +90,7 @@ plugin_manager(action="install_bundle", target="<本仓库目录的绝对路径>
 
 只升级**插件本身**可以完全走 GitHub：每个 `v*` tag 会由 Actions 自动打包并发 Release。
 
-1. 打开 Releases：`github.com/how8088/dsh-ima-kb-panel/releases`（仓库是私有的，用自己账号登录）
+1. 打开 Releases：`github.com/how8088/dsh-ima-kb-panel/releases`（公开仓库，不用登录）
 2. 下载最新的 `dsh-ima-kb-panel-<版本>.tgz`
 3. 在 DSH 里新开会话，把这句话发给 AI（路径换成实际路径）：
    ```
@@ -98,16 +98,18 @@ plugin_manager(action="install_bundle", target="<本仓库目录的绝对路径>
    ```
 4. 重启 DSH（或刷新页面）
 
-**第一次在新电脑上装完整体系**（这四样不在插件包里，各处理一次）：
+**第一次在新电脑上装完整体系**（这两样不在插件里自动完成，各处理一次）：
 
 | 东西 | 怎么弄 |
 |---|---|
 | ima 凭证 | 把 `~/.config/ima/client_id` 与 `api_key` 复制到新电脑同路径（**绝不要进仓库**） |
 | 两个技能 | **v2.2.0 起插件启动时会自动装到 `~/.dsh/skills/`（已存在不覆盖）**，无需手动；想手动就复制本仓库 `skills/` 过去 |
-| AGENTS.md 联动段 | 把本仓库 `docs/AGENTS-联动段.md` 的内容追加到 `~/.dsh/AGENTS.md` |
+| AGENTS.md 联动段 | 把 `docs/AGENTS-联动段.md` 的内容追加到 `~/.dsh/AGENTS.md`（v2.3.0 起这份文档随包安装，位在插件目录的 `docs/` 下） |
 | 通达信 MCP | 在新电脑的 DSH 里配置（token 只在你自己的机器上，仓库里没有） |
 
 > **技能现在随包自动安装**（v2.2.0 起）：插件启动时把 `market-research` / `ima-kb` 复制到 `~/.dsh/skills/`；目标已存在就跳过，**不会覆盖你改过的版本**。想更新技能就删掉旧目录再重启 DSH。
+>
+> **桌面版（Electron，kernel 包在 app.asar 里）不用再手工改 import**（v2.3.0 起）：插件启动时会先用裸包名解析 `@deepseek-ai/dsh-tools` / `@deepseek-ai/schemastery`，失败再按 `process.execPath` 反推安装目录从 `app.asar` 里读，换安装路径也不用改代码。以前那套「改 import 路径 + schemastery junction」的补丁可以退役了。
 
 ## 4. 装完怎么确认可用
 

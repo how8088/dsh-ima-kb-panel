@@ -166,7 +166,7 @@ check('磁盘缓存已写入', cacheFiles.length === 1, JSON.stringify(cacheFile
 const cachePayload = cacheFiles.length === 1
   ? JSON.parse(readFileSync(join(cacheDir, cacheFiles[0]), 'utf8'))
   : null
-check('磁盘缓存 v2 结构', cachePayload !== null && cachePayload.version === 3 && Array.isArray(cachePayload.list && cachePayload.list.notes), `version=${cachePayload && cachePayload.version}`)
+check('磁盘缓存 v3 结构', cachePayload !== null && cachePayload.version === 3 && Array.isArray(cachePayload.list && cachePayload.list.notes), `version=${cachePayload && cachePayload.version}`)
 const cachedEntries = cachePayload === null ? [] : Object.values(cachePayload.notes || {})
 const withModified = cachedEntries.filter((entry) => typeof entry.modified === 'number').length
 check('正文缓存带 modify_time', cachedEntries.length > 0 && withModified >= cachedEntries.length, `${withModified}/${cachedEntries.length}`)

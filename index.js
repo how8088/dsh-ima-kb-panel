@@ -32,11 +32,52 @@
 import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { dirname, join } from 'node:path'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import zlib from 'node:zlib'
-import { defineTool } from '@deepseek-ai/dsh-tools'
-import Schema from '@deepseek-ai/schemastery'
+
+/**
+ * 解析 DSH 自带的内部包（@deepseek-ai/dsh-tools、@deepseek-ai/schemastery）。
+ *
+ * 不能只写静态 import：桌面版的 kernel 包只存在于 app.asar 里，
+ * ~/.dsh/profiles/<profile>/node_modules 没有 fallback 副本，裸包名会
+ * ERR_MODULE_NOT_FOUND（换台机器装完 tgz 直接加载失败）。
+ *
+ * 所以先按裸包名试（CLI 版、测试桩都走这条）；失败再按 process.execPath
+ * 反推本机安装目录，从 app.asar 里读真实入口——用 execPath 推导而不是写死
+ * 绝对路径，换安装目录 / 换机器都不用改代码。
+ */
+async function importDshPackage(specifier) {
+  try {
+    return await import(specifier)
+  } catch {
+    // 落到下面的 asar 解析。
+  }
+  const dir = join(dirname(process.execPath), 'resources', 'app.asar', 'dsh', 'node_modules', specifier)
+  let manifest
+  try {
+    manifest = JSON.parse(readFileSync(join(dir, 'package.json'), 'utf8'))
+  } catch (error) {
+    throw new Error(`找不到 DSH 内部包 ${specifier}（裸包名和 app.asar 都没解析到）：${error instanceof Error ? error.message : String(error)}`)
+  }
+  const dot = manifest.exports !== null && typeof manifest.exports === 'object' ? manifest.exports['.'] : undefined
+  const entry = typeof manifest.exports === 'string'
+    ? manifest.exports
+    : typeof dot === 'string'
+      ? dot
+      : dot !== null && typeof dot === 'object'
+        ? dot.import || dot.default || dot.require
+        : manifest.module || manifest.main
+  if (typeof entry !== 'string' || entry === '') {
+    throw new Error(`DSH 内部包 ${specifier} 没有可用的入口字段`)
+  }
+  return await import(pathToFileURL(join(dir, entry)).href)
+}
+
+const dshTools = await importDshPackage('@deepseek-ai/dsh-tools')
+const defineTool = dshTools.defineTool
+const schemastery = await importDshPackage('@deepseek-ai/schemastery')
+const Schema = schemastery.default ?? schemastery
 
 export const name = 'ima-kb-panel'
 /** 不阻塞激活：服务都在 apply 里按需注入。 */
@@ -85,7 +126,14 @@ const DEFAULT_CREDENTIALS_DIR = join(homedir(), '.config', 'ima')
 const DEFAULT_BASE_URL = 'https://ima.qq.com'
 const DEFAULT_CACHE_DIR = join(homedir(), '.dsh', 'cache', 'ima-kb-panel')
 const ROUTE_PREFIX = '/ima-kb/api'
-const SKILL_VERSION = '1.1.10'
+/** 发给 ima 的版本标记：跟着 package.json 走，别再手改（以前写死成 1.1.10）。 */
+let SKILL_VERSION = 'unknown'
+try {
+  const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('./package.json', import.meta.url)), 'utf8'))
+  if (typeof manifest.version === 'string' && manifest.version !== '') SKILL_VERSION = manifest.version
+} catch {
+  // 测试把 index.js 复制到别处时没有 package.json，忽略即可。
+}
 
 /** ima list_note 单页上限（服务端硬限制）。 */
 const PAGE_SIZE = 20
@@ -398,6 +446,8 @@ async function imaApi(apiPath, body, options) {
 
 // ── 正文缓存（内存 + 磁盘） ──────────────────────────────────────────────
 const contentCache = new Map()
+/** noteId → 正在进行的取正文 Promise（避免同一篇重复请求）。 */
+const noteInflight = new Map()
 let diskLoaded = false
 let diskSaveTimer
 let diskFile
@@ -728,6 +778,21 @@ async function noteContent(noteId, priority, modified) {
     const noStamp = typeof cached.modified !== 'number' && typeof modified !== 'number'
     if (unchanged || noStamp) return cached
   }
+  // 同一篇正在取时复用那次请求：后台预热和用户点开同一篇不再打两次接口
+  // （ima 有限流，重复请求会白占闸门额度）。
+  const pending = noteInflight.get(noteId)
+  if (pending !== undefined) return pending
+  const task = fetchNoteContent(noteId, priority, modified)
+  noteInflight.set(noteId, task)
+  try {
+    return await task
+  } finally {
+    if (noteInflight.get(noteId) === task) noteInflight.delete(noteId)
+  }
+}
+
+/** 真正去 ima 取正文（含结构化失败时退回纯文本）。 */
+async function fetchNoteContent(noteId, priority, modified) {
   const data = await imaApi('openapi/note/v1/get_doc_content', {
     note_id: noteId,
     target_content_format: 2,
@@ -1217,11 +1282,57 @@ function decodeXmlEntities(value) {
 
 /**
  * 从 zip 里读出一个条目（docx 本质是 zip）。
- * 只支持标准本地文件头 + store/deflate 两种压缩方式，够读 docx。
+ *
+ * 走中央目录而不是顺序扫本地文件头：流式写入的 zip（通用位标记 bit 3）在本地头里
+ * 把压缩大小写成 0，顺序扫会把 word/document.xml 读成空且不报错——面板里就是一篇
+ * 空白 Word。中央目录里的长度永远是准的；找不到中央目录（截断包）时才退回顺序扫。
+ * 只支持 store(0) / deflate(8) 两种压缩方式，够读 docx。
  * @returns {Buffer|undefined} 解压后的内容
  */
 function readZipEntry(buffer, wantedName) {
   const { inflateRawSync } = zlib
+  const inflate = (method, data) => {
+    if (method === 0) return data
+    if (method === 8) return inflateRawSync(data)
+    return undefined
+  }
+  // End of Central Directory 签名 0x06054b50，注释最长 65535 字节。
+  const eocdMin = 22
+  const scanFrom = Math.max(0, buffer.length - eocdMin - 65535)
+  let eocd = -1
+  for (let offset = buffer.length - eocdMin; offset >= scanFrom; offset -= 1) {
+    if (buffer.readUInt32LE(offset) === 0x06054b50) {
+      eocd = offset
+      break
+    }
+  }
+  if (eocd !== -1) {
+    const count = buffer.readUInt16LE(eocd + 10)
+    let offset = buffer.readUInt32LE(eocd + 16)
+    for (let index = 0; index < count; index += 1) {
+      if (offset + 46 > buffer.length || buffer.readUInt32LE(offset) !== 0x02014b50) break
+      const flags = buffer.readUInt16LE(offset + 8)
+      const method = buffer.readUInt16LE(offset + 10)
+      const compressedSize = buffer.readUInt32LE(offset + 20)
+      const nameLength = buffer.readUInt16LE(offset + 28)
+      const extraLength = buffer.readUInt16LE(offset + 30)
+      const commentLength = buffer.readUInt16LE(offset + 32)
+      const localOffset = buffer.readUInt32LE(offset + 42)
+      const name = buffer.toString('utf8', offset + 46, offset + 46 + nameLength)
+      if (name === wantedName) {
+        if ((flags & 0x1) !== 0) return undefined // 加密条目读不了
+        if (localOffset + 30 > buffer.length) return undefined
+        const localNameLength = buffer.readUInt16LE(localOffset + 26)
+        const localExtraLength = buffer.readUInt16LE(localOffset + 28)
+        const dataStart = localOffset + 30 + localNameLength + localExtraLength
+        const dataEnd = dataStart + compressedSize
+        if (dataEnd > buffer.length) return undefined
+        return inflate(method, buffer.subarray(dataStart, dataEnd))
+      }
+      offset += 46 + nameLength + extraLength + commentLength
+    }
+  }
+  // 兜底：没有中央目录（例如写到一半的包），顺序扫本地文件头。
   let offset = 0
   while (offset + 30 <= buffer.length) {
     if (buffer.readUInt32LE(offset) !== 0x04034b50) return undefined
@@ -1234,12 +1345,8 @@ function readZipEntry(buffer, wantedName) {
     const dataStart = nameStart + nameLength + extraLength
     const dataEnd = dataStart + compressedSize
     if (dataEnd > buffer.length) return undefined
-    if (name === wantedName) {
-      const data = buffer.subarray(dataStart, dataEnd)
-      if (method === 0) return data
-      if (method === 8) return inflateRawSync(data)
-      return undefined
-    }
+    if (name === wantedName) return inflate(method, buffer.subarray(dataStart, dataEnd))
+    if (compressedSize === 0) return undefined // 本地头没写长度，顺序扫不下去了
     offset = dataEnd
   }
   return undefined
@@ -1289,11 +1396,26 @@ async function kbFileText(mediaId, title) {
     throw new Error(`取文件失败：${error instanceof Error ? error.message : String(error)}`)
   }
   if (!response.ok) throw new Error(`取文件失败：HTTP ${response.status}`)
-  const arrayBuffer = await response.arrayBuffer()
-  if (arrayBuffer.byteLength > KB_TEXT_MAX_BYTES) {
-    throw new Error(`文件太大（${Math.round(arrayBuffer.byteLength / 1048576)} MB），请点「下载原文」`)
+  // 先看响应头：几百 MB 的文件不该「先整个拉进内存再判断超限」。
+  const declared = Number(response.headers.get('content-length') ?? 0)
+  if (Number.isFinite(declared) && declared > KB_TEXT_MAX_BYTES) {
+    throw new Error(`文件太大（${Math.round(declared / 1048576)} MB），请点「下载原文」`)
   }
-  const buffer = Buffer.from(arrayBuffer)
+  // 流式累计，超限立刻中断——服务端不给 content-length 时也守得住上限。
+  const chunks = []
+  let received = 0
+  if (response.body !== null) {
+    for await (const chunk of response.body) {
+      received += chunk.length
+      if (received > KB_TEXT_MAX_BYTES) {
+        throw new Error(`文件太大（超过 ${Math.round(KB_TEXT_MAX_BYTES / 1048576)} MB），请点「下载原文」`)
+      }
+      chunks.push(Buffer.from(chunk))
+    }
+  } else {
+    chunks.push(Buffer.from(await response.arrayBuffer()))
+  }
+  const buffer = Buffer.concat(chunks)
   let text = kind === 'docx' ? extractDocxText(buffer) : buffer.toString('utf8')
   if (kind === 'markdown') {
     // Markdown 里的图片在面板里显示不了，换成占位符，避免一串 ![](...) 干扰阅读。
@@ -1607,20 +1729,24 @@ function registerTools(ctx) {
       kb_id: { type: 'string', required: true, description: '知识库 id，来自 kb_space_list。' },
       folder_id: { type: 'string', description: '要浏览的文件夹 media_id；省略表示根目录。' },
       limit: { type: 'number', description: '最多返回多少条，1~50，默认 50。' },
+      cursor: { type: 'string', description: '翻页游标：上一页输出里给的 cursor；不填表示第一页。' },
     },
     output: TEXT_OUTPUT,
     async execute(args) {
       const kbId = typeof args?.kb_id === 'string' ? args.kb_id.trim() : ''
       if (kbId === '') return 'kb_id 不能为空。先用 kb_space_list 看有哪些知识库。'
       const folderId = typeof args?.folder_id === 'string' ? args.folder_id.trim() : ''
+      const cursor = typeof args?.cursor === 'string' ? args.cursor.trim() : ''
       const limit = clamp(args?.limit ?? 50, 1, 50)
-      const dir = await listKbDirectory(kbId, folderId, '')
+      const dir = await listKbDirectory(kbId, folderId, cursor)
       const shown = dir.items.slice(0, limit)
       const path = dir.path.map((node) => node.name).join(' / ') || '根目录'
       if (shown.length === 0) return `「${path}」是空的。`
       const folders = shown.filter((item) => item.folder)
       const files = shown.filter((item) => !item.folder)
-      const lines = [`${path} · 文件夹 ${folders.length} 个，文件 ${files.length} 个${dir.items.length > limit ? `（共 ${dir.items.length} 条，已截断）` : ''}：`, '']
+      const page = cursor === '' ? '第 1 页' : '下一页'
+      const more = dir.isEnd ? '已到末页' : '还有更多'
+      const lines = [`${path} · 本页 ${shown.length} 条（文件夹 ${folders.length} 个，文件 ${files.length} 个；${page}，${more}）`, '']
       for (const item of folders) {
         lines.push(`- [文件夹] ${item.title}`)
         lines.push(`  media_id: ${item.mediaId}`)
@@ -1630,6 +1756,9 @@ function registerTools(ctx) {
         lines.push(`  media_id: ${item.mediaId}`)
       }
       lines.push('', '进子文件夹：kb_space_browse(kb_id, folder_id=<文件夹的 media_id>)。')
+      if (dir.isEnd === false && dir.nextCursor !== '') {
+        lines.push(`列出下一页：kb_space_browse(kb_id, folder_id=${folderId === '' ? '（省略）' : folderId}, cursor="${dir.nextCursor}")`)
+      }
       lines.push('下载原文：在侧边栏「ima 知识库」面板的知识库页里点「下载原文」。')
       return lines.join('\n')
     },
@@ -1938,19 +2067,35 @@ function registerRoutes(ctx) {
             sendJson(res, 404, { error: 'no downloadable url' })
             return
           }
-          const upstream = await fetch(info.url, { headers: info.headers })
+          // 透传 Range：面板里 PDF 走 iframe，没有它就不能拖进度条 / 跳页。
+          const rangeHeader = req.headers.range
+          const upstream = await fetch(info.url, {
+            headers: rangeHeader === undefined ? info.headers : { ...info.headers, range: rangeHeader },
+          })
           if (!upstream.ok || upstream.body === null) {
             sendJson(res, 502, { error: `upstream ${upstream.status}` })
             return
           }
           const title = url.searchParams.get('title') ?? 'file'
-          const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream'
-          const headers = { 'content-type': contentType, 'cache-control': 'no-store' }
+          const headers = {
+            'content-type': upstream.headers.get('content-type') ?? 'application/octet-stream',
+            'cache-control': 'no-store',
+            'accept-ranges': 'bytes',
+          }
+          const contentRange = upstream.headers.get('content-range')
+          if (contentRange !== null) headers['content-range'] = contentRange
+          const contentLength = upstream.headers.get('content-length')
+          if (contentLength !== null) headers['content-length'] = contentLength
           // inline=1 用于面板里 iframe 直接看 PDF；否则按下载处理。
           if (!inline) headers['content-disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(title)}`
-          res.writeHead(200, headers)
+          res.writeHead(upstream.status, headers)
           for await (const chunk of upstream.body) {
-            res.write(chunk)
+            // 尊重写背压：几百 MB 的文件不能一直往内存里堆。
+            if (!res.write(chunk)) {
+              await new Promise((resolve) => {
+                res.once('drain', resolve)
+              })
+            }
           }
           res.end()
           return

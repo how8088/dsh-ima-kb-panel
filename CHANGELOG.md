@@ -1,5 +1,34 @@
 # Changelog
 
+## 2.3.0 — 2026-11-05
+
+**部署**：换一台桌面版机器装完 tgz 就能用，不用再手工打补丁。
+
+- **DSH 内部包解析改成可移植写法**：以前 `import … from '@deepseek-ai/dsh-tools'` 在桌面版会
+  `ERR_MODULE_NOT_FOUND`（kernel 包只在 app.asar 里，profile 的 node_modules 没有 fallback），
+  装完必须手工把 import 改成本机绝对路径、再手动 junction `schemastery`。现在先按裸包名解析，
+  失败再按 `process.execPath` 反推安装目录、从 `app.asar` 读真实入口，**换安装目录也不用改代码**。
+- 发布包里带上 `docs/AGENTS-联动段.md`（`files` 增加 `docs/**`），新机器不用再去仓库里翻。
+- `package.json` 补上 `repository` / `bugs` / `engines`（代码用到 `AbortSignal.timeout`，需 Node ≥18）。
+- 发版 workflow 增加「tag 必须等于 package.json 版本」的校验，避免发错版本的包。
+
+**修 bug**：
+
+- **大文件不再先整个进内存**：`kbFileText` 原来先 `arrayBuffer()` 再判断 24 MB 上限，注释说
+  「避免几百 MB 拉进内存」其实没做到。现在先看 `content-length`，再流式累计、超限立刻中断。
+- **docx 解析走中央目录**：流式写入的 zip（通用位标记 bit 3）在本地头里压缩大小为 0，
+  原实现会把 `word/document.xml` 读成空且**不报错**，面板显示一篇空白 Word。现在优先读中央目录，
+  找不到才退回顺序扫；加密条目直接放弃。
+- **`kb_space_browse` 支持翻页**：新增 `cursor` 参数并在输出里给出下一页提示。
+  以前只能看到第一页 50 条，大目录后面的文件永远取不到。
+- **`/kb-raw` 透传 Range**：面板内嵌 PDF 现在能拖进度条 / 跳页；同时按 `res.write` 的返回值
+  处理写背压，几百 MB 的文件不再无界堆在内存里。
+- **同一篇笔记不再重复请求**：`noteContent` 增加 in-flight 去重，后台预热和用户点开同一篇
+  共用同一次请求（ima 限流下不再白占闸门额度）。
+- **连点两篇不再串味**：客户端 `openNote` 加请求序号，只认最后一次响应，旧响应不会覆盖新正文。
+- **`SKILL_VERSION` 跟着 package.json 走**：以前写死 `1.1.10`，发给 ima 的
+  `ima-openapi-ctx: skill_version` 一直是旧值。
+
 ## 2.2.0 — 2026-11-05
 
 - **后台列表刷新降为低优先级**：列表「先用旧的、后台刷新」时，刷新请求排到预热之后，

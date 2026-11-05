@@ -594,6 +594,8 @@ window.__ModuleLoader__.load({
       const readerRef = React.useRef(null)
       const selectedRef = React.useRef(null)
       const docRef = React.useRef(null)
+      /** 打开笔记的请求序号：连点两篇时，只认最后一次的响应，避免旧响应覆盖新正文。 */
+      const openSeqRef = React.useRef(0)
       selectedRef.current = selected
       docRef.current = doc
 
@@ -693,6 +695,8 @@ window.__ModuleLoader__.load({
 
       const openNote = React.useCallback(async (noteId, start, anchor) => {
         const from = Math.max(0, start)
+        const seq = openSeqRef.current + 1
+        openSeqRef.current = seq
         setSelected(noteId)
         setDocError(null)
         setTocOpen(false)
@@ -701,6 +705,7 @@ window.__ModuleLoader__.load({
           const payload = await getJson(
             API + '/note?id=' + encodeURIComponent(noteId) + '&start=' + from + '&length=' + WINDOW_CHARS,
           )
+          if (openSeqRef.current !== seq) return
           setDoc({
             id: payload.id,
             title: payload.title,
@@ -721,10 +726,11 @@ window.__ModuleLoader__.load({
             return next
           })
         } catch (error) {
+          if (openSeqRef.current !== seq) return
           setDoc(null)
           setDocError(describeError(error, t))
         } finally {
-          setLoadingDoc(false)
+          if (openSeqRef.current === seq) setLoadingDoc(false)
         }
       }, [])
 
