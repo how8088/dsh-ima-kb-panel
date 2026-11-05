@@ -105,6 +105,8 @@ window.__ModuleLoader__.load({
         kbCacheClear: '清空本地缓存',
         kbCacheMore: '更多操作',
         kbCacheConfirmClear: '确认清空？',
+        refreshConfirm: '确认刷新？',
+        refreshHint: '清空正文缓存并重新抓取全部笔记（约 1 分钟）。',
         kbCacheWarming: (stage, done, total) => stage === 'text' ? `正在缓存正文 ${done}/${total}` : '正在缓存目录…',
         kbCacheDone: (files, texts, failed) => `已缓存 ${files} 个文件${texts > 0 ? `、${texts} 篇正文` : ''}${failed > 0 ? `，${failed} 篇失败` : ''}`,
         kbCacheShared: '订阅 / 加入的知识库不做本地缓存，按需在线读取。',
@@ -200,6 +202,8 @@ window.__ModuleLoader__.load({
         kbCacheClear: 'Clear local cache',
         kbCacheMore: 'More actions',
         kbCacheConfirmClear: 'Confirm clear?',
+        refreshConfirm: 'Confirm refresh?',
+        refreshHint: 'Clear cached texts and re-fetch every note (about a minute).',
         kbCacheWarming: (stage, done, total) => stage === 'text' ? `Caching texts ${done}/${total}` : 'Caching folders…',
         kbCacheDone: (files, texts, failed) => `Cached ${files} files${texts > 0 ? `, ${texts} texts` : ''}${failed > 0 ? `, ${failed} failed` : ''}`,
         kbCacheShared: 'Subscribed / joined spaces are not cached locally; they stay online-only.',
@@ -630,6 +634,9 @@ window.__ModuleLoader__.load({
       /** 危险/重活（更新快照、清空）收进「⋯」菜单，避免顺手点掉。 */
       const [kbCacheMenu, setKbCacheMenu] = React.useState(false)
       const [kbCacheConfirm, setKbCacheConfirm] = React.useState(false)
+      /** 顶栏的全局「刷新」同样是清缓存 + 全量重取，一起收进 ⋯。 */
+      const [headMenu, setHeadMenu] = React.useState(false)
+      const [refreshConfirm, setRefreshConfirm] = React.useState(false)
       const [kbQ, setKbQ] = React.useState(snap === null || typeof snap.kbQ !== 'string' ? '' : snap.kbQ)
       const [kbResults, setKbResults] = React.useState(snap === null ? null : snap.kbResults)
       const [kbSearching, setKbSearching] = React.useState(false)
@@ -1276,6 +1283,16 @@ window.__ModuleLoader__.load({
         document.addEventListener('mousedown', close)
         return () => document.removeEventListener('mousedown', close)
       }, [kbCacheMenu])
+
+      React.useEffect(() => {
+        if (!headMenu) return undefined
+        const close = () => {
+          setHeadMenu(false)
+          setRefreshConfirm(false)
+        }
+        document.addEventListener('mousedown', close)
+        return () => document.removeEventListener('mousedown', close)
+      }, [headMenu])
 
       const runKbSearch = React.useCallback(async (value) => {
         const q = String(value || '').trim()
@@ -2072,15 +2089,49 @@ window.__ModuleLoader__.load({
             ),
           ),
           h(
-            'button',
-            {
-              className: 'ima-kb-button',
-              type: 'button',
-              title: t.refresh,
-              onClick: onRefresh,
-              disabled: loadingNotes,
-            },
-            t.refresh,
+            'div',
+            { className: 'ima-kb-headmenu' },
+            h(
+              'button',
+              {
+                className: 'ima-kb-kbcache-more',
+                type: 'button',
+                title: t.kbCacheMore,
+                'aria-label': t.kbCacheMore,
+                'aria-expanded': headMenu ? 'true' : 'false',
+                disabled: loadingNotes,
+                onMouseDown: (event) => event.stopPropagation(),
+                onClick: () => {
+                  setHeadMenu((open) => !open)
+                  setRefreshConfirm(false)
+                },
+              },
+              '⋯',
+            ),
+            headMenu
+              ? h(
+                  'div',
+                  { className: 'ima-kb-headmenu-pop', onMouseDown: (event) => event.stopPropagation() },
+                  h(
+                    'button',
+                    {
+                      className: 'ima-kb-kbcache-item ima-kb-kbcache-item-danger',
+                      type: 'button',
+                      onClick: () => {
+                        if (!refreshConfirm) {
+                          setRefreshConfirm(true)
+                          return
+                        }
+                        setRefreshConfirm(false)
+                        setHeadMenu(false)
+                        onRefresh()
+                      },
+                    },
+                    refreshConfirm ? t.refreshConfirm : t.refresh,
+                  ),
+                  h('div', { className: 'ima-kb-headmenu-hint' }, t.refreshHint),
+                )
+              : null,
           ),
         ),
         tab === 'notes' && warmRunning
@@ -2224,6 +2275,9 @@ window.__ModuleLoader__.load({
       '.ima-kb-kbcache-item{height:24px;padding:0 8px;font-size:11px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);cursor:pointer}',
       '.ima-kb-kbcache-item:hover{background:var(--dsw-alias-bg-layer-2)}',
       '.ima-kb-kbcache-item-danger{color:#d9534f;border-color:rgba(217,83,79,.45)}',
+      '.ima-kb-headmenu{position:relative;flex:0 0 auto}',
+      '.ima-kb-headmenu-pop{position:absolute;top:32px;right:0;z-index:30;display:flex;flex-direction:column;gap:6px;min-width:220px;padding:8px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);box-shadow:0 8px 24px rgba(0,0,0,.18)}',
+      '.ima-kb-headmenu-hint{font-size:11px;line-height:1.4;color:var(--dsw-alias-label-secondary);max-width:240px}',
       '.ima-kb-search{flex:1 1 auto;min-width:0;padding:8px;box-sizing:border-box}',
       '.ima-kb-input{width:100%;height:30px;padding:0 10px;font-size:12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);outline:none;box-sizing:border-box}',
       '.ima-kb-input:focus{border-color:var(--dsw-alias-brand-primary)}',
