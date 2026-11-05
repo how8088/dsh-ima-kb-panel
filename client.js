@@ -24,6 +24,19 @@ window.__ModuleLoader__.load({
     const TAB_KEY = 'dsh-ima-kb-panel:tab'
     const COLLAPSED_KEY = 'dsh-ima-kb-panel:collapsed'
     const KB_KEY = 'dsh-ima-kb-panel:kb'
+    const RECENT_KEY = 'dsh-ima-kb-panel:recent'
+    /** 「最近阅读」最多记几篇。 */
+    const RECENT_MAX = 6
+
+    /** 行级别的键盘可达性：Enter / 空格 等价于点击。 */
+    function rowKey(action) {
+      return (event) => {
+        if (event.key === 'Enter' || event.key === ' ') {
+          event.preventDefault()
+          action()
+        }
+      }
+    }
 
     /** 分类的展示顺序；不在表里的按拼音排到最后。 */
     const GROUP_ORDER = [
@@ -105,6 +118,13 @@ window.__ModuleLoader__.load({
         openNoteOfFile: '打开对应笔记',
         kbLinkNoFile: '知识库里没找到同标题的文件',
         linkNoNote: '笔记里没有同标题的一篇',
+        recentHeading: '最近阅读',
+        recentClear: '清空',
+        hitPrev: '上一处',
+        hitNext: '下一处',
+        hitNav: (index, total) => `第 ${index}/${total} 处`,
+        shortcutFocus: 'Ctrl+K 聚焦搜索',
+        shortcutTabs: 'Alt+1 笔记 / Alt+2 知识库',
       },
       en: {
         title: 'ima Knowledge Base',
@@ -178,6 +198,13 @@ window.__ModuleLoader__.load({
         openNoteOfFile: 'Open note',
         kbLinkNoFile: 'No file with the same title in the knowledge base',
         linkNoNote: 'No note with the same title',
+        recentHeading: 'Recent',
+        recentClear: 'Clear',
+        hitPrev: 'Prev',
+        hitNext: 'Next',
+        hitNav: (index, total) => `Match ${index}/${total}`,
+        shortcutFocus: 'Ctrl+K to focus search',
+        shortcutTabs: 'Alt+1 notes / Alt+2 spaces',
       },
     }
 
@@ -390,6 +417,7 @@ window.__ModuleLoader__.load({
             role: 'button',
             tabIndex: 0,
             onClick: () => onToggle(group.name),
+            onKeyDown: rowKey(() => onToggle(group.name)),
           },
           h('span', { className: 'ima-kb-cat-chevron' }, isCollapsed ? '▸' : '▾'),
           h('span', { className: 'ima-kb-cat-name' }, group.name),
@@ -421,6 +449,7 @@ window.__ModuleLoader__.load({
                       tabIndex: 0,
                       'data-active': selected === note.id ? 'true' : 'false',
                       onClick: () => onOpen(note.id),
+                      onKeyDown: rowKey(() => onOpen(note.id)),
                     },
                     h('div', { className: 'ima-kb-row-title' }, note.title),
                     h(
@@ -469,6 +498,20 @@ window.__ModuleLoader__.load({
       const [doc, setDoc] = React.useState(null)
       const [docError, setDocError] = React.useState(null)
       const [loadingDoc, setLoadingDoc] = React.useState(false)
+      /** 最近阅读（跨会话）；进入面板时恢复上次那篇。 */
+      const [recent, setRecent] = React.useState(() => {
+        try {
+          const parsed = JSON.parse(readLocal(RECENT_KEY, '[]'))
+          return Array.isArray(parsed) ? parsed.filter((item) => item !== null && typeof item.id === 'string').slice(0, RECENT_MAX) : []
+        } catch {
+          return []
+        }
+      })
+      const restoredRef = React.useRef(false)
+      const searchInputRef = React.useRef(null)
+      const kbSearchInputRef = React.useRef(null)
+      /** 阅读器内「上一处/下一处」命中导航的当前位置。 */
+      const [hitIndex, setHitIndex] = React.useState(0)
       /** 阅读器：本篇章节目录开关、跨笔记的滚动位置记忆、笔记→知识库文件跳转状态。 */
       const [tocOpen, setTocOpen] = React.useState(false)
       const scrollMemoRef = React.useRef({})
@@ -624,6 +667,16 @@ window.__ModuleLoader__.load({
             start: from,
             end: payload.end,
             anchor: typeof anchor === 'number' ? anchor : null,
+          })
+          setRecent((current) => {
+            const entry = { id: payload.id, title: payload.title, at: Date.now() }
+            const next = [entry, ...current.filter((item) => item.id !== payload.id)].slice(0, RECENT_MAX)
+            try {
+              writeLocal(RECENT_KEY, JSON.stringify(next))
+            } catch {
+              // 记不住「最近阅读」不影响阅读。
+            }
+            return next
           })
         } catch (error) {
           setDoc(null)
@@ -802,6 +855,42 @@ window.__ModuleLoader__.load({
         node.scrollTop = Math.max(0, ratio * (node.scrollHeight - node.clientHeight))
         setTocOpen(false)
       }, [])
+
+      // ── 快捷键：Ctrl/Cmd+K 聚焦搜索，Alt+1 / Alt+2 切页签 ──
+      React.useEffect(() => {
+        const onKeyDown = (event) => {
+          const mod = event.ctrlKey || event.metaKey
+          if (mod && !event.shiftKey && !event.altKey && String(event.key || '').toLowerCase() === 'k') {
+            const target = tab === 'kb' ? kbSearchInputRef.current : searchInputRef.current
+            if (target !== null) {
+              event.preventDefault()
+              target.focus()
+              target.select()
+            }
+            return
+          }
+          if (event.altKey && !mod && (event.key === '1' || event.key === '2')) {
+            event.preventDefault()
+            switchTab(event.key === '1' ? 'notes' : 'kb')
+          }
+        }
+        window.addEventListener('keydown', onKeyDown)
+        return () => window.removeEventListener('keydown', onKeyDown)
+      }, [tab, switchTab])
+
+      /** 进面板时恢复上次读的那篇（跨会话），只恢复一次。 */
+      React.useEffect(() => {
+        if (restoredRef.current) return
+        if (doc !== null) {
+          restoredRef.current = true
+          return
+        }
+        if (!Array.isArray(notes) || notes.length === 0) return
+        restoredRef.current = true
+        const last = recent[0]
+        if (!last || !notes.some((note) => note && note.id === last.id)) return
+        openNote(last.id, 0, null)
+      }, [doc, notes, recent, openNote])
 
       const onRefresh = React.useCallback(async () => {
         setResults(null)
@@ -1061,6 +1150,39 @@ window.__ModuleLoader__.load({
       const searchingMode = terms.length > 0
       const rows = searchingMode && results && Array.isArray(results.matches) ? results.matches : null
 
+      /** 阅读器里当前搜索词的命中位置（用于「上一处 / 下一处」）。 */
+      const docHits = React.useMemo(() => {
+        if (doc === null || terms.length === 0) return []
+        const lower = doc.content.toLowerCase()
+        const found = []
+        for (const term of terms) {
+          const needle = term.toLowerCase()
+          if (needle === '') continue
+          let at = lower.indexOf(needle)
+          while (at !== -1 && found.length < 500) {
+            found.push(at)
+            at = lower.indexOf(needle, at + needle.length)
+          }
+        }
+        found.sort((left, right) => left - right)
+        return found
+      }, [doc, query])
+
+      React.useEffect(() => {
+        setHitIndex(0)
+      }, [doc === null ? null : doc.id, query])
+
+      const jumpToHit = React.useCallback((delta) => {
+        const node = readerRef.current
+        const current = docRef.current
+        if (node === null || current === null || docHits.length === 0) return
+        const next = ((hitIndex + delta) % docHits.length + docHits.length) % docHits.length
+        setHitIndex(next)
+        const ratio = Math.min(1, docHits[next] / Math.max(1, current.content.length))
+        node.scrollTop = Math.max(0, ratio * (node.scrollHeight - node.clientHeight) - 140)
+        scrollMemoRef.current[current.id] = node.scrollTop
+      }, [docHits, hitIndex])
+
       const kbSearchingMode = String(kbQ || '').trim() !== ''
       const kbOverview = selectedKb !== ''
         ? (kbs || []).find((item) => item.id === selectedKb) || null
@@ -1145,8 +1267,17 @@ window.__ModuleLoader__.load({
             className: 'ima-kb-input',
             type: 'search',
             value: query,
+            ref: searchInputRef,
+            title: t.shortcutFocus,
             placeholder: t.searchPlaceholder,
             onChange: (event) => setQuery(event.target.value),
+            onKeyDown: (event) => {
+              if (event.key === 'Escape') {
+                setQuery('')
+                setResults(null)
+                setFindResults(null)
+              }
+            },
           }),
         ),
         notesError !== null
@@ -1217,6 +1348,7 @@ window.__ModuleLoader__.load({
                             role: 'button',
                             tabIndex: 0,
                             onClick: () => openNote(match.noteId, Math.max(0, match.offset - JUMP_LEAD), match.anchor),
+                            onKeyDown: rowKey(() => openNote(match.noteId, Math.max(0, match.offset - JUMP_LEAD), match.anchor)),
                           },
                           h('div', { className: 'ima-kb-row-title' }, match.title),
                           h('div', { className: 'ima-kb-row-meta' }, 'offset ' + formatNumber(match.offset)),
@@ -1229,6 +1361,48 @@ window.__ModuleLoader__.load({
                                 null,
                                 truncated && maxNotes !== null
                                   ? h('div', { className: 'ima-kb-hint' }, t.truncated(maxNotes))
+                                  : null,
+                                recent.length > 0
+                                  ? h(
+                                      'div',
+                                      { className: 'ima-kb-recent' },
+                                      h(
+                                        'div',
+                                        { className: 'ima-kb-group' },
+                                        h('span', null, t.recentHeading),
+                                        h(
+                                          'button',
+                                          {
+                                            type: 'button',
+                                            className: 'ima-kb-linkbtn',
+                                            onClick: () => {
+                                              setRecent([])
+                                              try {
+                                                writeLocal(RECENT_KEY, '[]')
+                                              } catch {
+                                                // 忽略
+                                              }
+                                            },
+                                          },
+                                          t.recentClear,
+                                        ),
+                                      ),
+                                      recent.map((item) =>
+                                        h(
+                                          'div',
+                                          {
+                                            key: 'recent-' + item.id,
+                                            className: 'ima-kb-row ima-kb-recent-row',
+                                            role: 'button',
+                                            tabIndex: 0,
+                                            'data-active': selected === item.id ? 'true' : 'false',
+                                            onClick: () => openNote(item.id, 0, null),
+                                            onKeyDown: rowKey(() => openNote(item.id, 0, null)),
+                                          },
+                                          h('div', { className: 'ima-kb-row-title' }, item.title || item.id),
+                                        ),
+                                      ),
+                                    )
                                   : null,
                                 groups === null
                                   ? h('div', { className: 'ima-kb-group' }, t.loading)
@@ -1279,8 +1453,16 @@ window.__ModuleLoader__.load({
                       className: 'ima-kb-input',
                       type: 'search',
                       value: kbQ,
+                      ref: kbSearchInputRef,
+                      title: t.shortcutFocus,
                       placeholder: t.kbSearchPlaceholder,
                       onChange: (event) => setKbQ(event.target.value),
+                      onKeyDown: (event) => {
+                        if (event.key === 'Escape') {
+                          setKbQ('')
+                          setKbResults(null)
+                        }
+                      },
                     }),
                   ),
                   kbSearchingMode
@@ -1312,6 +1494,10 @@ window.__ModuleLoader__.load({
                                       if (item.folder) enterFolder(item)
                                       else selectFile(item, '')
                                     },
+                                    onKeyDown: rowKey(() => {
+                                      if (item.folder) enterFolder(item)
+                                      else selectFile(item, '')
+                                    }),
                                   },
                                   h('div', { className: 'ima-kb-row-title' }, item.title),
                                   h(
@@ -1621,6 +1807,33 @@ window.__ModuleLoader__.load({
                           )
                         : null,
                       h('button', { className: 'ima-kb-button', type: 'button', onClick: openKbForDoc }, t.openInKb),
+                      docHits.length > 0
+                        ? h(
+                            'span',
+                            { className: 'ima-kb-hitnav' },
+                            h(
+                              'button',
+                              {
+                                className: 'ima-kb-button ima-kb-hitbtn',
+                                type: 'button',
+                                title: t.hitPrev,
+                                onClick: () => jumpToHit(-1),
+                              },
+                              '↑',
+                            ),
+                            h('span', { className: 'ima-kb-hitlabel' }, t.hitNav(hitIndex + 1, docHits.length)),
+                            h(
+                              'button',
+                              {
+                                className: 'ima-kb-button ima-kb-hitbtn',
+                                type: 'button',
+                                title: t.hitNext,
+                                onClick: () => jumpToHit(1),
+                              },
+                              '↓',
+                            ),
+                          )
+                        : null,
                       doc.end < doc.chars
                         ? h(
                             'button',
@@ -1723,6 +1936,14 @@ window.__ModuleLoader__.load({
       '.ima-kb-toc-item{display:block;width:100%;text-align:left;font:inherit;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);background:none;border:none;border-radius:6px;padding:5px 8px;cursor:pointer}',
       '.ima-kb-toc-item:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
       '.ima-kb-button[data-active="true"]{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}',
+      '.ima-kb-hitnav{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto}',
+      '.ima-kb-hitbtn{height:26px;padding:0 8px;font-size:12px;line-height:1}',
+      '.ima-kb-hitlabel{font-size:11px;color:var(--dsw-alias-label-secondary);min-width:64px;text-align:center}',
+      '.ima-kb-recent{margin:2px 4px 6px}',
+      '.ima-kb-recent .ima-kb-group{display:flex;align-items:center;justify-content:space-between;gap:8px;padding-bottom:4px}',
+      '.ima-kb-recent-row{padding:5px 10px}',
+      '.ima-kb-linkbtn{font:inherit;font-size:10.5px;color:var(--dsw-alias-label-secondary);background:none;border:none;cursor:pointer;padding:0 2px;border-radius:4px}',
+      '.ima-kb-linkbtn:hover{color:var(--dsw-alias-brand-primary)}',
       '.ima-kb-empty{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12.5px;padding:24px;text-align:center}',
       '.ima-kb-hint{color:var(--dsw-alias-label-secondary);font-size:12px;padding:6px 10px;line-height:1.6;word-break:break-word}',
       '.ima-kb-mark{background:transparent;color:var(--dsw-alias-brand-primary);font-weight:600;border-bottom:2px solid var(--dsw-alias-brand-primary)}',
