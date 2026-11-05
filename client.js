@@ -843,6 +843,18 @@ window.__ModuleLoader__.load({
         loadKbs()
       }, [tab, conn, kbs, loadKbs])
 
+      /**
+       * 首次进入知识库页（或恢复了上次选中的库）时，自动加载它的根目录。
+       * v1.5.0 之前这里漏了：只有「手动切换下拉框 / 点文件夹」才会发请求，
+       * 于是面板一进来就永远停在「加载中…」——就是用户截图里那个状态。
+       */
+      React.useEffect(() => {
+        if (tab !== 'kb') return
+        if (kbs === null || selectedKb === '') return
+        if (dirItems !== null || dirLoading || dirError !== null) return
+        loadDir(selectedKb, '', '', false)
+      }, [tab, kbs, selectedKb, dirItems, dirLoading, dirError, loadDir])
+
       const runKbSearch = React.useCallback(async (value) => {
         const q = String(value || '').trim()
         if (q === '' || selectedKb === '') {
@@ -1187,7 +1199,11 @@ window.__ModuleLoader__.load({
                             )
                           : null,
                         dirItems === null
-                          ? h('div', { className: 'ima-kb-group' }, dirLoading ? t.loading : t.loading)
+                          ? h(
+                              'div',
+                              { className: 'ima-kb-group' },
+                              dirLoading || selectedKb !== '' ? t.loading : t.kbPickKb,
+                            )
                           : h(
                               'div',
                               null,
