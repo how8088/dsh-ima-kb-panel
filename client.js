@@ -493,13 +493,22 @@ window.__ModuleLoader__.load({
       })
     }
 
+    /**
+     * 面板被切走时 DSH 会「卸载再挂载」组件（不是隐藏），state 全丢 —— 这就是
+     * "点出去再点回来，阅读位置/检索词全没了"的原因。客户端模块在整个页面生命周期里
+     * 只加载一次，所以这里放一个模块级快照：切走时存，切回来时直接复原，零请求。
+     */
+    let panelSnapshot = null
+
     // ── 面板 ──────────────────────────────────────────────────────────
     function Panel() {
       useLocaleTick()
       const t = text()
+      const snap = panelSnapshot
 
       // 页签与折叠状态（跨会话记住）。
       const [tab, setTab] = React.useState(() => {
+        if (snap !== null && (snap.tab === 'kb' || snap.tab === 'notes')) return snap.tab
         const saved = readLocal(TAB_KEY, 'notes')
         return saved === 'kb' ? 'kb' : 'notes'
       })
@@ -512,16 +521,16 @@ window.__ModuleLoader__.load({
       })
 
       // ── 笔记侧 ──
-      const [notes, setNotes] = React.useState(null)
+      const [notes, setNotes] = React.useState(snap === null ? null : snap.notes)
       const [truncated, setTruncated] = React.useState(false)
       const [maxNotes, setMaxNotes] = React.useState(null)
       const [notesError, setNotesError] = React.useState(null)
       const [loadingNotes, setLoadingNotes] = React.useState(false)
-      const [warm, setWarm] = React.useState(null)
+      const [warm, setWarm] = React.useState(snap === null ? null : snap.warm)
       const [warming, setWarming] = React.useState(false)
-      const [selected, setSelected] = React.useState(null)
+      const [selected, setSelected] = React.useState(snap === null ? null : snap.selected)
       const [conn, setConn] = React.useState(null)
-      const [doc, setDoc] = React.useState(null)
+      const [doc, setDoc] = React.useState(snap === null ? null : snap.doc)
       const [docError, setDocError] = React.useState(null)
       const [loadingDoc, setLoadingDoc] = React.useState(false)
       /** 最近阅读（跨会话）；进入面板时恢复上次那篇。 */
@@ -541,39 +550,45 @@ window.__ModuleLoader__.load({
       const [hitIndex, setHitIndex] = React.useState(0)
       /** 阅读器：本篇章节目录开关、跨笔记的滚动位置记忆、笔记→知识库文件跳转状态。 */
       const [tocOpen, setTocOpen] = React.useState(false)
-      const scrollMemoRef = React.useRef({})
+      const scrollMemoRef = React.useRef(
+        snap !== null && snap.doc !== null && snap.doc !== undefined && typeof snap.scrollTop === 'number'
+          ? { [snap.doc.id]: snap.scrollTop }
+          : {},
+      )
+      /** 当前阅读器滚动位置（卸载时不需要读 DOM，直接取这个）。 */
+      const liveScrollRef = React.useRef(snap === null ? 0 : snap.scrollTop || 0)
       const [linkError, setLinkError] = React.useState(null)
-      const [query, setQuery] = React.useState('')
-      const [results, setResults] = React.useState(null)
+      const [query, setQuery] = React.useState(snap === null || typeof snap.query !== 'string' ? '' : snap.query)
+      const [results, setResults] = React.useState(snap === null ? null : snap.results)
       const [searching, setSearching] = React.useState(false)
       const [searchError, setSearchError] = React.useState(null)
       const [searchPartial, setSearchPartial] = React.useState(false)
       const rerunRef = React.useRef(false)
       /** 字面检索没命中时，自动用官方分词检索补一轮（kb_find）。 */
-      const [findResults, setFindResults] = React.useState(null)
+      const [findResults, setFindResults] = React.useState(snap === null ? null : snap.findResults)
       const [findError, setFindError] = React.useState(null)
       const findQRef = React.useRef('')
 
       // ── 知识库侧 ──
-      const [kbs, setKbs] = React.useState(null)
+      const [kbs, setKbs] = React.useState(snap === null ? null : snap.kbs)
       const [kbError, setKbError] = React.useState(null)
-      const [selectedKb, setSelectedKb] = React.useState(() => readLocal(KB_KEY, ''))
-      const [dirItems, setDirItems] = React.useState(null)
-      const [dirPath, setDirPath] = React.useState([])
-      const [dirNext, setDirNext] = React.useState('')
-      const [dirIsEnd, setDirIsEnd] = React.useState(true)
+      const [selectedKb, setSelectedKb] = React.useState(() => (snap !== null && typeof snap.selectedKb === 'string' && snap.selectedKb !== '' ? snap.selectedKb : readLocal(KB_KEY, '')))
+      const [dirItems, setDirItems] = React.useState(snap === null ? null : snap.dirItems)
+      const [dirPath, setDirPath] = React.useState(snap === null || !Array.isArray(snap.dirPath) ? [] : snap.dirPath)
+      const [dirNext, setDirNext] = React.useState(snap === null || typeof snap.dirNext !== 'string' ? '' : snap.dirNext)
+      const [dirIsEnd, setDirIsEnd] = React.useState(snap === null ? true : snap.dirIsEnd !== false)
       const [dirLoading, setDirLoading] = React.useState(false)
       const [dirLoadingMore, setDirLoadingMore] = React.useState(false)
       const [dirError, setDirError] = React.useState(null)
-      const [kbQ, setKbQ] = React.useState('')
-      const [kbResults, setKbResults] = React.useState(null)
+      const [kbQ, setKbQ] = React.useState(snap === null || typeof snap.kbQ !== 'string' ? '' : snap.kbQ)
+      const [kbResults, setKbResults] = React.useState(snap === null ? null : snap.kbResults)
       const [kbSearching, setKbSearching] = React.useState(false)
       const [kbSearchError, setKbSearchError] = React.useState(null)
-      const [fileSel, setFileSel] = React.useState(null)
-      const [fileInfo, setFileInfo] = React.useState(null)
+      const [fileSel, setFileSel] = React.useState(snap === null ? null : snap.fileSel)
+      const [fileInfo, setFileInfo] = React.useState(snap === null ? null : snap.fileInfo)
       const [fileText, setFileText] = React.useState(null)
       const [fileTextLoading, setFileTextLoading] = React.useState(false)
-      const [fileFolderLabel, setFileFolderLabel] = React.useState('')
+      const [fileFolderLabel, setFileFolderLabel] = React.useState(snap === null || typeof snap.fileFolderLabel !== 'string' ? '' : snap.fileFolderLabel)
       const [copied, setCopied] = React.useState(false)
 
       const readerRef = React.useRef(null)
@@ -827,6 +842,7 @@ window.__ModuleLoader__.load({
         (event) => {
           const node = event.currentTarget
           const current = docRef.current
+          liveScrollRef.current = node.scrollTop
           if (current !== null) scrollMemoRef.current[current.id] = node.scrollTop
           if (node.scrollHeight - node.scrollTop - node.clientHeight < 320) loadMore()
         },
@@ -1051,6 +1067,36 @@ window.__ModuleLoader__.load({
         }
       }, [])
 
+      /**
+       * 从模块快照恢复「上次看的知识库文件」时只有文件信息、没有正文，
+       * 这里补取一次正文（正常点文件时 selectFile 已经取过，不会走到这里）。
+       */
+      React.useEffect(() => {
+        if (fileSel === null || fileText !== null || fileTextLoading) return undefined
+        let alive = true
+        setFileTextLoading(true)
+        getJson(
+          API + '/kb-text?media_id=' + encodeURIComponent(fileSel.mediaId) + '&title=' + encodeURIComponent(fileSel.title || ''),
+        )
+          .then((payload) => {
+            if (alive) setFileText(payload)
+          })
+          .catch((error) => {
+            if (alive) {
+              setFileText({
+                kind: 'error', text: '', chars: 0, truncated: false, inlineUrl: '',
+                error: String((error && error.message) || error),
+              })
+            }
+          })
+          .finally(() => {
+            if (alive) setFileTextLoading(false)
+          })
+        return () => {
+          alive = false
+        }
+      }, [fileSel, fileText, fileTextLoading])
+
       /** 笔记 → 知识库原文：同标题在「我的知识库」里找对应文件并切过去。 */
       const openKbForDoc = React.useCallback(async () => {
         const current = docRef.current
@@ -1157,6 +1203,17 @@ window.__ModuleLoader__.load({
         } catch {
           // 剪贴板不可用就算了。
         }
+      }, [])
+
+      // 每次渲染记录一份最新状态；面板被卸载时写进模块级快照，切回来直接复原。
+      const snapshotRef = React.useRef({})
+      snapshotRef.current = {
+        tab, notes, warm, selected, doc, query, results, findResults,
+        kbs, selectedKb, dirItems, dirPath, dirNext, dirIsEnd,
+        fileSel, fileInfo, fileFolderLabel, kbQ, kbResults,
+      }
+      React.useEffect(() => () => {
+        panelSnapshot = { ...snapshotRef.current, scrollTop: liveScrollRef.current }
       }, [])
 
       const groups = React.useMemo(() => buildGroups(notes), [notes])
