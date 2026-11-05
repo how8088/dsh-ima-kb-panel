@@ -153,6 +153,15 @@ check('/warm-status 认全部已缓存', status.body.running === false && status
 
 const cacheFiles = existsSync(cacheDir) ? readdirSync(cacheDir).filter((name) => name.endsWith('.json')) : []
 check('磁盘缓存已写入', cacheFiles.length === 1, JSON.stringify(cacheFiles))
+// v1.5.0：磁盘缓存里要同时有「整份笔记列表」和每篇的 modify_time，重启才能增量预热。
+const cachePayload = cacheFiles.length === 1
+  ? JSON.parse(readFileSync(join(cacheDir, cacheFiles[0]), 'utf8'))
+  : null
+check('磁盘缓存 v2 结构', cachePayload !== null && cachePayload.version === 2 && Array.isArray(cachePayload.list && cachePayload.list.notes), `version=${cachePayload && cachePayload.version}`)
+const cachedEntries = cachePayload === null ? [] : Object.values(cachePayload.notes || {})
+const withModified = cachedEntries.filter((entry) => typeof entry.modified === 'number').length
+check('正文缓存带 modify_time', cachedEntries.length > 0 && withModified >= cachedEntries.length, `${withModified}/${cachedEntries.length}`)
+check('磁盘缓存带笔记列表', cachePayload !== null && cachePayload.list.notes.length === rows.length, `${cachePayload && cachePayload.list && cachePayload.list.notes.length} vs ${rows.length}`)
 
 // ── 4. /search 与偏移量契约 ───────────────────────────────────────────
 console.log('=== /search ===')

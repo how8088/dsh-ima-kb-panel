@@ -63,8 +63,8 @@ export const Config = Schema.object({
     .step(1)
     .min(1)
     .max(10080)
-    .default(360)
-    .description('笔记正文缓存多少分钟（内存 + 磁盘）；笔记是静态的，重取很贵'),
+    .default(10080)
+    .description('磁盘正文缓存最长保留多久（分钟）。是否重取由笔记的 modify_time 决定，不靠这个值'),
   cacheDir: Schema.string()
     .default('')
     .description('正文缓存目录；留空用 ~/.dsh/cache/ima-kb-panel，填 - 表示不落盘'),
@@ -96,10 +96,15 @@ const SEARCH_WARM_BUDGET_HTTP_MS = 150000
 
 /**
  * ima 的调用频率限制：实测连续快速请求约 10 次后开始返回
- * `code=200001 请求频率超限`（HTTP 403），间隔 700ms 的串行请求 15/15 全部成功。
- * 这里取 800ms 留余量；所有 ima 请求共用一个串行闸门，交互请求优先于后台预热。
+ * `code=200001 请求频率超限`（HTTP 403）。
+ * 2026-11-05 实测：串行「返回后再隔 800ms」= 每篇 1.5s；
+ * 「最多 2 个在飞 + 相邻请求起步间隔 700ms」= 每篇 0.74s，24 次零限流（快 2 倍）。
  */
-const MIN_REQUEST_INTERVAL_MS = 800
+const MIN_REQUEST_INTERVAL_MS = 700
+/** 同时在飞的 ima 请求上限（实测 2 安全）。 */
+const MAX_IN_FLIGHT = 2
+/** 预热时的并发 worker 数（配合闸门 = 约 1.4 请求/秒）。 */
+const WARM_CONCURRENCY = 2
 const RATE_LIMIT_CODE = 200001
 const RETRY_LIMIT = 4
 const RETRY_BASE_MS = 900
@@ -116,7 +121,8 @@ const WINDOW_LIMIT_MAX = 40
 const READ_LIMIT_DEFAULT = 6000
 const READ_LIMIT_MAX = 30000
 
-const DISK_CACHE_VERSION = 1
+/** 磁盘缓存格式版本（v2 起带每篇 modify_time 与笔记列表）。 */
+const DISK_CACHE_VERSION = 2
 
 /** 运行时设置；apply 时由 Loader 解析后的 Config 覆盖。 */
 const settings = {
@@ -125,7 +131,7 @@ const settings = {
   clientIdEnv: 'IMA_CLIENT_ID',
   apiKeyEnv: 'IMA_API_KEY',
   maxNotes: 500,
-  contentTtlMs: 360 * 60 * 1000,
+  contentTtlMs: 10080 * 60 * 1000,
   cacheDir: DEFAULT_CACHE_DIR,
   titleFilter: [],
 }
@@ -151,7 +157,7 @@ function resolveSettings(raw) {
   settings.clientIdEnv = nonEmptyString(config.clientIdEnv) || 'IMA_CLIENT_ID'
   settings.apiKeyEnv = nonEmptyString(config.apiKeyEnv) || 'IMA_API_KEY'
   settings.maxNotes = clamp(config.maxNotes ?? 500, 1, 500)
-  settings.contentTtlMs = clamp(config.contentTtlMinutes ?? 360, 1, 10080) * 60 * 1000
+  settings.contentTtlMs = clamp(config.contentTtlMinutes ?? 10080, 1, 10080) * 60 * 1000
   const rawCacheDir = nonEmptyString(config.cacheDir)
   settings.cacheDir = rawCacheDir === '-' ? '' : rawCacheDir || DEFAULT_CACHE_DIR
   settings.titleFilter = String(config.titleFilter ?? '')
@@ -208,33 +214,56 @@ function credentials() {
   return state
 }
 
-// ── ima 请求闸门：串行 + 最小间隔 + 限流退避重试 ─────────────────────────
+// ── ima 请求闸门：最多 2 个在飞 + 700ms 起步间隔 + 限流退避重试 ───────────
 /**
- * 所有 ima 请求排一条队。priority 小的先发：面板点击（0）永远排在后台预热（1）前面，
- * 否则用户点开一篇笔记要等 69 篇正文预热完。返回的 Promise 由 pump 逐个兑现。
+ * 实测：串行「等上一个请求返回后再隔 800ms」每篇要 1.5s；改成「最多 2 个请求在飞、
+ * 相邻请求起步间隔 700ms」后每篇 0.74s，24 次并发请求零限流（code=200001）——
+ * 预热速度直接翻倍。priority 小的先发：面板点击（0）排在后台预热（1）前面，
+ * 用户点开一篇笔记不用等全部预热完。
  */
 const requestQueue = []
 let pumping = false
-let lastRequestAt = 0
+let lastStartAt = 0
+let inFlight = 0
 let requestSeq = 0
+
+/** 队列里挑优先级最高（同优先级按先进先出）的一件。 */
+function takeNextRequest() {
+  let best = 0
+  for (let i = 1; i < requestQueue.length; i += 1) {
+    const current = requestQueue[i]
+    const top = requestQueue[best]
+    if (current.priority < top.priority || (current.priority === top.priority && current.seq < top.seq)) best = i
+  }
+  return requestQueue.splice(best, 1)[0]
+}
 
 function pump() {
   if (pumping) return
   pumping = true
   ;(async () => {
     try {
-      while (requestQueue.length > 0) {
-        requestQueue.sort((left, right) => left.priority - right.priority || left.seq - right.seq)
-        const item = requestQueue.shift()
-        const wait = MIN_REQUEST_INTERVAL_MS - (Date.now() - lastRequestAt)
-        if (wait > 0) await sleep(wait)
-        try {
-          item.resolve(await item.task())
-        } catch (error) {
-          item.reject(error)
-        } finally {
-          lastRequestAt = Date.now()
+      for (;;) {
+        if (requestQueue.length === 0) break
+        if (inFlight >= MAX_IN_FLIGHT) {
+          await sleep(30)
+          continue
         }
+        const item = takeNextRequest()
+        const wait = MIN_REQUEST_INTERVAL_MS - (Date.now() - lastStartAt)
+        if (wait > 0) await sleep(wait)
+        lastStartAt = Date.now()
+        inFlight += 1
+        Promise.resolve()
+          .then(() => item.task())
+          .then(
+            (value) => item.resolve(value),
+            (error) => item.reject(error),
+          )
+          .finally(() => {
+            inFlight -= 1
+            pump()
+          })
       }
     } finally {
       pumping = false
@@ -336,13 +365,12 @@ function cacheFile() {
 }
 
 function freshContent(noteId) {
-  const cached = contentCache.get(noteId)
-  if (cached === undefined) return undefined
-  if (Date.now() - cached.at >= settings.contentTtlMs) return undefined
-  return cached
+  // 正文是静态的：是否过期由「列表里的 modify_time 变了没有」决定，
+  // 不再靠时间 TTL 一刀切（旧做法 6 小时后把 70 篇全部重取，就是慢的主因）。
+  return contentCache.get(noteId)
 }
 
-/** 首次用到正文时把磁盘缓存读回内存（过期条目直接丢）。 */
+/** 首次用到正文时把磁盘缓存读回内存（过期条目直接丢，笔记列表也一起恢复）。 */
 function ensureDiskLoaded() {
   if (diskLoaded) return
   diskLoaded = true
@@ -361,7 +389,19 @@ function ensureDiskLoaded() {
     if (entry === null || typeof entry !== 'object' || typeof entry.content !== 'string') continue
     const at = Number(entry.at) || 0
     if (Date.now() - at >= settings.contentTtlMs) continue
-    contentCache.set(noteId, { content: entry.content, at })
+    contentCache.set(noteId, {
+      content: entry.content,
+      at,
+      modified: typeof entry.modified === 'number' ? entry.modified : undefined,
+    })
+  }
+  // 列表也落盘：重启后面板立即可用，预热只需补「变过的笔记」。
+  const list = payload.list !== null && typeof payload.list === 'object' ? payload.list : null
+  if (list !== null && Array.isArray(list.notes) && list.notes.length > 0) {
+    const at = Number(list.at) || 0
+    if (Date.now() - at < LIST_TTL_MS * 12) {
+      notesCache = { at, notes: list.notes, truncated: Boolean(list.truncated) }
+    }
   }
 }
 
@@ -371,9 +411,22 @@ function writeDiskCache() {
   const notes = {}
   for (const [noteId, entry] of contentCache) {
     if (Date.now() - entry.at >= settings.contentTtlMs) continue
-    notes[noteId] = { content: entry.content, at: entry.at }
+    notes[noteId] = {
+      content: entry.content,
+      at: entry.at,
+      ...(typeof entry.modified === 'number' ? { modified: entry.modified } : {}),
+    }
   }
-  const payload = JSON.stringify({ version: DISK_CACHE_VERSION, baseUrl: settings.baseUrl, savedAt: Date.now(), notes })
+  const list = notesCache === undefined
+    ? null
+    : { at: notesCache.at, truncated: notesCache.truncated === true, notes: notesCache.notes }
+  const payload = JSON.stringify({
+    version: DISK_CACHE_VERSION,
+    baseUrl: settings.baseUrl,
+    savedAt: Date.now(),
+    notes,
+    list,
+  })
   try {
     mkdirSync(settings.cacheDir, { recursive: true })
     const temp = `${file}.tmp-${process.pid}`
@@ -463,6 +516,7 @@ function matchesTitleFilter(title) {
  * 响应里用 `is_end` 标记是否到底。只取第一页会静默丢掉后面的笔记，所以这里翻页。
  */
 async function listNotes() {
+  ensureDiskLoaded()
   if (notesCache !== undefined && Date.now() - notesCache.at < LIST_TTL_MS) return notesCache.notes
   const notes = []
   let cursor = ''
@@ -500,16 +554,30 @@ async function listNotes() {
   return capped
 }
 
-async function noteContent(noteId, priority) {
+/**
+ * 取一篇笔记的正文。
+ * @param {string} noteId - 笔记 id。
+ * @param {number} priority - 0 交互 / 1 后台预热。
+ * @param {number} [modified] - 列表里的 modify_time；与缓存记录一致就不重取。
+ */
+async function noteContent(noteId, priority, modified) {
   ensureDiskLoaded()
-  const cached = freshContent(noteId)
-  if (cached !== undefined) return cached
+  const cached = contentCache.get(noteId)
+  if (cached !== undefined) {
+    const unchanged = typeof modified === 'number' && cached.modified === modified
+    const noStamp = typeof cached.modified !== 'number' && typeof modified !== 'number'
+    if (unchanged || noStamp) return cached
+  }
   const data = await imaApi('openapi/note/v1/get_doc_content', {
     note_id: noteId,
     target_content_format: 0,
   }, { priority: priority ?? 0 })
   const content = typeof data?.content === 'string' ? data.content : ''
-  const entry = { content, at: Date.now() }
+  const entry = {
+    content,
+    at: Date.now(),
+    ...(typeof modified === 'number' ? { modified } : {}),
+  }
   contentCache.set(noteId, entry)
   scheduleDiskSave()
   return entry
@@ -527,7 +595,7 @@ function notesWithChars(notes) {
 }
 
 /**
- * 把缺正文的笔记逐篇取回（串行、低优先级，避免打断用户点击）。
+ * 只把「缺正文或 modify_time 变过」的笔记取回（2 并发、低优先级，避免打断用户点击）。
  * 同一时刻只允许一个预热在跑，重复调用复用同一个 Promise。
  */
 function warmAll() {
@@ -535,7 +603,12 @@ function warmAll() {
   const run = (async () => {
     ensureDiskLoaded()
     const notes = await listNotes()
-    const queue = notes.filter((note) => freshContent(note.id) === undefined)
+    const queue = notes.filter((note) => {
+      const cached = contentCache.get(note.id)
+      if (cached === undefined) return true
+      const unchanged = typeof note.modified === 'number' && cached.modified === note.modified
+      return unchanged === false
+    })
     warmState.running = true
     warmState.total = queue.length
     warmState.done = 0
@@ -545,21 +618,30 @@ function warmAll() {
     saveSuppressed += 1
     const failedIds = []
     try {
-      for (const note of queue) {
-        try {
-          await noteContent(note.id, 1)
-        } catch {
-          // 单篇失败不拖垮整体：搜索时跳过它即可，进度里记失败数。
-          warmState.failed += 1
-          failedIds.push(note.id)
+      let cursor = 0
+      const worker = async () => {
+        for (;;) {
+          const index = cursor
+          cursor += 1
+          if (index >= queue.length) return
+          const note = queue[index]
+          try {
+            await noteContent(note.id, 1, note.modified)
+          } catch {
+            // 单篇失败不拖垮整体：搜索时跳过它即可，进度里记失败数。
+            warmState.failed += 1
+            failedIds.push(note.id)
+          }
+          warmState.done += 1
         }
-        warmState.done += 1
       }
+      await Promise.all(Array.from({ length: Math.min(WARM_CONCURRENCY, queue.length) }, worker))
       // 一轮结束后把失败的再补一次：撞限流退避之后常常能成功。
       let recovered = 0
       for (const noteId of failedIds) {
+        const meta = notes.find((note) => note.id === noteId)
         try {
-          await noteContent(noteId, 1)
+          await noteContent(noteId, 1, meta === undefined ? undefined : meta.modified)
           recovered += 1
         } catch {
           // 两次都失败就放弃，检索时按「跳过 N 篇」处理。
@@ -1083,7 +1165,8 @@ function registerTools(ctx) {
       const noteId = typeof args?.note_id === 'string' ? args.note_id.trim() : ''
       if (noteId === '') return 'note_id 不能为空。先用 kb_list 看可用的笔记。'
       const limit = clamp(args?.limit ?? READ_LIMIT_DEFAULT, 1, READ_LIMIT_MAX)
-      const cached = await noteContent(noteId, 0)
+      const meta = await noteMeta(noteId)
+      const cached = await noteContent(noteId, 0, meta.modified)
       const content = cached.content
       if (content === '') return `笔记 ${noteId} 是空的。`
       const total = content.length
@@ -1092,7 +1175,6 @@ function registerTools(ctx) {
         return `offset=${offset} 已超出笔记长度（共 ${formatCount(total)} 字）。从 0 开始或用 kb_search 定位。`
       }
       const end = Math.min(total, offset + limit)
-      const meta = await noteMeta(noteId)
       const header = `[${meta.title} · 字符 ${formatCount(offset)}–${formatCount(end)} / 共 ${formatCount(total)}]`
       const footer =
         end >= total
@@ -1359,11 +1441,11 @@ function registerRoutes(ctx) {
           return
         }
         const limit = clamp(url.searchParams.get('length') ?? 30000, 1, 60000)
-        const cached = await noteContent(noteId, 0)
+        const meta = await noteMeta(noteId)
+        const cached = await noteContent(noteId, 0, meta.modified)
         const total = cached.content.length
         const start = clamp(url.searchParams.get('start') ?? 0, 0, total)
         const end = Math.min(total, start + limit)
-        const meta = await noteMeta(noteId)
         sendJson(res, 200, {
           id: noteId,
           title: meta.title,

@@ -919,11 +919,16 @@ window.__ModuleLoader__.load({
       const warmDone = warm && typeof warm.done === 'number' ? warm.done : 0
       const warmTotal = warm && typeof warm.total === 'number' ? warm.total : 0
       const warmPercent = warmTotal > 0 ? Math.min(100, Math.round((warmDone / warmTotal) * 100)) : 0
+      const warmCached = warm && typeof warm.cached === 'number' ? warm.cached : 0
+      const warmListed = warm && typeof warm.listed === 'number' ? warm.listed : 0
+      const cacheNote = warmRunning
+        ? ''
+        : (warmListed > 0 && warmCached < warmListed ? ' · 已缓存 ' + warmCached + '/' + warmListed : '')
 
       const subtitle = tab === 'kb'
         ? (kbs !== null ? t.kbSubtitle(kbs.length) : t.loading)
         : (Array.isArray(notes) && notes.length > 0
-            ? t.totalNotes(notes.length, formatNumber(totalChars)) + (filterText !== '' ? ' · ' + filterText : '')
+            ? t.totalNotes(notes.length, formatNumber(totalChars)) + (filterText !== '' ? ' · ' + filterText : '') + cacheNote
             : t.subtitle)
 
       // ── 首次运行：凭证引导 ──
