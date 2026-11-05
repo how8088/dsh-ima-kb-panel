@@ -97,15 +97,18 @@ const SEARCH_WARM_BUDGET_HTTP_MS = 150000
 
 /**
  * ima 的调用频率限制：实测连续快速请求约 10 次后开始返回
- * `code=200001 请求频率超限`（HTTP 403）。
- * 2026-11-05 实测：串行「返回后再隔 800ms」= 每篇 1.5s；
- * 「最多 2 个在飞 + 相邻请求起步间隔 700ms」= 每篇 0.74s，24 次零限流（快 2 倍）。
+ * `code=200001 请求频率超限`（HTTP 403）。实测（24 篇一组）：
+ *  - 串行「返回后再隔 800ms」= 每篇 1.5s；
+ *  - 2 个在飞 + 起步间隔 700ms = 0.74s；
+ *  - **3 个在飞 + 600ms = 0.58s，零限流**（当前采用）；
+ *  - 3 个 + 450ms：服务端降速到 1.24s，不划算；
+ *  - 4 个 + 400ms：直接触发 200001。
  */
-const MIN_REQUEST_INTERVAL_MS = 700
-/** 同时在飞的 ima 请求上限（实测 2 安全）。 */
-const MAX_IN_FLIGHT = 2
-/** 预热时的并发 worker 数（配合闸门 = 约 1.4 请求/秒）。 */
-const WARM_CONCURRENCY = 2
+const MIN_REQUEST_INTERVAL_MS = 600
+/** 同时在飞的 ima 请求上限（实测 3 安全、4 会限流）。 */
+const MAX_IN_FLIGHT = 3
+/** 预热时的并发 worker 数（配合闸门 ≈ 1.7 请求/秒）。 */
+const WARM_CONCURRENCY = 3
 const RATE_LIMIT_CODE = 200001
 const RETRY_LIMIT = 4
 const RETRY_BASE_MS = 900
@@ -511,14 +514,11 @@ function matchesTitleFilter(title) {
 }
 
 /**
- * 列出（标题过滤后的）全部笔记。
- *
+ * 从 ima 翻页取回完整的笔记列表并写缓存（不做「先用旧列表」的短路）。
  * ima 的 list_note 单页上限 20，`cursor` 是「已经取过的条数」的十进制字符串，
  * 响应里用 `is_end` 标记是否到底。只取第一页会静默丢掉后面的笔记，所以这里翻页。
  */
-async function listNotes() {
-  ensureDiskLoaded()
-  if (notesCache !== undefined && Date.now() - notesCache.at < LIST_TTL_MS) return notesCache.notes
+async function fetchAllNotes() {
   const notes = []
   let cursor = ''
   let fetched = 0
@@ -552,7 +552,37 @@ async function listNotes() {
   const truncated = reachedEnd === false && notes.length >= settings.maxNotes
   const capped = notes.slice(0, settings.maxNotes)
   notesCache = { at: Date.now(), notes: capped, truncated }
+  openNoteList = undefined
   return capped
+}
+
+/** 旧列表最长还能用多久（先用旧的、后台刷新，最多容忍一天）。 */
+const LIST_STALE_SERVE_MS = 24 * 60 * 60 * 1000
+/** 后台刷新进行中（避免同一时间刷多次）。 */
+let refreshingNotes
+/** 正在进行的「首次列表拉取」，让并发调用共用一次请求链。 */
+let openNoteList
+
+/**
+ * 列出（标题过滤后的）全部笔记。
+ *
+ * 新鲜（5 分钟内）直接用；超过 5 分钟但不到一天：**先返回旧列表**，同时后台刷新 ——
+ * 面板首屏不用再等 4 次列表请求（约 3 秒），新笔记会在后台刷新完成后出现。
+ */
+async function listNotes() {
+  ensureDiskLoaded()
+  const now = Date.now()
+  if (notesCache !== undefined && now - notesCache.at < LIST_TTL_MS) return notesCache.notes
+  if (notesCache !== undefined && now - notesCache.at < LIST_STALE_SERVE_MS) {
+    if (refreshingNotes === undefined) {
+      refreshingNotes = fetchAllNotes().catch(() => {}).finally(() => { refreshingNotes = undefined })
+    }
+    return notesCache.notes
+  }
+  if (openNoteList === undefined) {
+    openNoteList = fetchAllNotes().finally(() => { openNoteList = undefined })
+  }
+  return openNoteList
 }
 
 // ── 笔记正文：取结构化格式再转成可读文本 ────────────────────────────────

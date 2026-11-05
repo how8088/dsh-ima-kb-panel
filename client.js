@@ -119,6 +119,9 @@ window.__ModuleLoader__.load({
         kbLinkNoFile: '知识库里没找到同标题的文件',
         linkNoNote: '笔记里没有同标题的一篇',
         recentHeading: '最近阅读',
+        recentCollapse: '折叠最近阅读',
+        recentExpand: '展开最近阅读',
+        allNotes: '全部笔记',
         recentClear: '清空',
         hitPrev: '上一处',
         hitNext: '下一处',
@@ -199,6 +202,9 @@ window.__ModuleLoader__.load({
         kbLinkNoFile: 'No file with the same title in the knowledge base',
         linkNoNote: 'No note with the same title',
         recentHeading: 'Recent',
+        recentCollapse: 'Collapse recent',
+        recentExpand: 'Expand recent',
+        allNotes: 'All notes',
         recentClear: 'Clear',
         hitPrev: 'Prev',
         hitNext: 'Next',
@@ -527,6 +533,7 @@ window.__ModuleLoader__.load({
           return []
         }
       })
+      const [recentOpen, setRecentOpen] = React.useState(true)
       const restoredRef = React.useRef(false)
       const searchInputRef = React.useRef(null)
       const kbSearchInputRef = React.useRef(null)
@@ -1388,8 +1395,18 @@ window.__ModuleLoader__.load({
                                       { className: 'ima-kb-recent' },
                                       h(
                                         'div',
-                                        { className: 'ima-kb-group' },
-                                        h('span', null, t.recentHeading),
+                                        { className: 'ima-kb-recent-head' },
+                                        h('span', { className: 'ima-kb-recent-title' }, t.recentHeading),
+                                        h(
+                                          'button',
+                                          {
+                                            type: 'button',
+                                            className: 'ima-kb-iconbtn',
+                                            title: recentOpen ? t.recentCollapse : t.recentExpand,
+                                            onClick: () => setRecentOpen((value) => !value),
+                                          },
+                                          recentOpen ? '▾' : '▸',
+                                        ),
                                         h(
                                           'button',
                                           {
@@ -1407,23 +1424,31 @@ window.__ModuleLoader__.load({
                                           t.recentClear,
                                         ),
                                       ),
-                                      recent.map((item) =>
-                                        h(
-                                          'div',
-                                          {
-                                            key: 'recent-' + item.id,
-                                            className: 'ima-kb-row ima-kb-recent-row',
-                                            role: 'button',
-                                            tabIndex: 0,
-                                            'data-active': selected === item.id ? 'true' : 'false',
-                                            onClick: () => openNote(item.id, 0, null),
-                                            onKeyDown: rowKey(() => openNote(item.id, 0, null)),
-                                          },
-                                          h('div', { className: 'ima-kb-row-title' }, item.title || item.id),
-                                        ),
-                                      ),
+                                      recentOpen
+                                        ? recent.map((item) =>
+                                            h(
+                                              'div',
+                                              {
+                                                key: 'recent-' + item.id,
+                                                className: 'ima-kb-recent-row',
+                                                role: 'button',
+                                                tabIndex: 0,
+                                                'data-active': selected === item.id ? 'true' : 'false',
+                                                onClick: () => openNote(item.id, 0, null),
+                                                onKeyDown: rowKey(() => openNote(item.id, 0, null)),
+                                              },
+                                              h('div', { className: 'ima-kb-recent-name' }, item.title || item.id),
+                                            ),
+                                          )
+                                        : null,
                                     )
                                   : null,
+                                h(
+                                  'div',
+                                  { className: 'ima-kb-section-head' },
+                                  h('span', null, t.allNotes),
+                                  notes !== null ? h('span', null, formatNumber(notes.length)) : null,
+                                ),
                                 groups === null
                                   ? h('div', { className: 'ima-kb-group' }, t.loading)
                                   : groups.length === 0
@@ -1965,9 +1990,17 @@ window.__ModuleLoader__.load({
       '.ima-kb-hitnav{display:inline-flex;align-items:center;gap:4px;flex:0 0 auto}',
       '.ima-kb-hitbtn{height:26px;padding:0 8px;font-size:12px;line-height:1}',
       '.ima-kb-hitlabel{font-size:11px;color:var(--dsw-alias-label-secondary);min-width:64px;text-align:center}',
-      '.ima-kb-recent{margin:2px 4px 6px}',
-      '.ima-kb-recent .ima-kb-group{display:flex;align-items:center;justify-content:space-between;gap:8px;padding-bottom:4px}',
-      '.ima-kb-recent-row{padding:5px 10px}',
+      '.ima-kb-recent{margin:8px 8px 10px;padding:8px;border:1px solid var(--dsw-alias-border-l1);border-radius:10px;background:var(--dsw-alias-bg-layer-1)}',
+      '.ima-kb-recent-head{display:flex;align-items:center;gap:6px;padding:0 2px 6px;font-size:11px;color:var(--dsw-alias-label-secondary)}',
+      '.ima-kb-recent-title{flex:1 1 auto;min-width:0;font-weight:600;letter-spacing:.04em}',
+      '.ima-kb-recent-row{display:flex;align-items:center;gap:6px;padding:5px 8px;border-radius:6px;cursor:pointer;outline:none}',
+      '.ima-kb-recent-row:hover{background:var(--dsw-alias-bg-layer-2)}',
+      '.ima-kb-recent-row[data-active="true"]{background:var(--dsw-alias-bg-layer-2)}',
+      '.ima-kb-recent-row:before{content:"·";flex:0 0 auto;color:var(--dsw-alias-label-secondary);font-size:13px;line-height:1}',
+      '.ima-kb-recent-name{font-size:12px;font-weight:400;color:var(--dsw-alias-label-secondary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
+      '.ima-kb-section-head{display:flex;align-items:center;justify-content:space-between;gap:8px;margin:2px 10px 2px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l1);font-size:11px;color:var(--dsw-alias-label-secondary);letter-spacing:.04em}',
+      '.ima-kb-iconbtn{font:inherit;font-size:11px;line-height:1;color:var(--dsw-alias-label-secondary);background:none;border:none;cursor:pointer;padding:2px 4px;border-radius:4px}',
+      '.ima-kb-iconbtn:hover{color:var(--dsw-alias-brand-primary);background:var(--dsw-alias-bg-layer-2)}',
       '.ima-kb-linkbtn{font:inherit;font-size:10.5px;color:var(--dsw-alias-label-secondary);background:none;border:none;cursor:pointer;padding:0 2px;border-radius:4px}',
       '.ima-kb-linkbtn:hover{color:var(--dsw-alias-brand-primary)}',
       '.ima-kb-empty{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12.5px;padding:24px;text-align:center}',
