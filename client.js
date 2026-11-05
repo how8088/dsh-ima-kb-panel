@@ -102,7 +102,9 @@ window.__ModuleLoader__.load({
         kbCacheAt: (when) => `快照 ${when}`,
         kbCacheWarm: '缓存到本地',
         kbCacheUpdate: '更新快照',
-        kbCacheClear: '清空',
+        kbCacheClear: '清空本地缓存',
+        kbCacheMore: '更多操作',
+        kbCacheConfirmClear: '确认清空？',
         kbCacheWarming: (stage, done, total) => stage === 'text' ? `正在缓存正文 ${done}/${total}` : '正在缓存目录…',
         kbCacheDone: (files, texts, failed) => `已缓存 ${files} 个文件${texts > 0 ? `、${texts} 篇正文` : ''}${failed > 0 ? `，${failed} 篇失败` : ''}`,
         kbCacheShared: '订阅 / 加入的知识库不做本地缓存，按需在线读取。',
@@ -195,7 +197,9 @@ window.__ModuleLoader__.load({
         kbCacheAt: (when) => `snapshot ${when}`,
         kbCacheWarm: 'Cache locally',
         kbCacheUpdate: 'Refresh snapshot',
-        kbCacheClear: 'Clear',
+        kbCacheClear: 'Clear local cache',
+        kbCacheMore: 'More actions',
+        kbCacheConfirmClear: 'Confirm clear?',
         kbCacheWarming: (stage, done, total) => stage === 'text' ? `Caching texts ${done}/${total}` : 'Caching folders…',
         kbCacheDone: (files, texts, failed) => `Cached ${files} files${texts > 0 ? `, ${texts} texts` : ''}${failed > 0 ? `, ${failed} failed` : ''}`,
         kbCacheShared: 'Subscribed / joined spaces are not cached locally; they stay online-only.',
@@ -623,6 +627,9 @@ window.__ModuleLoader__.load({
       const [kbCache, setKbCache] = React.useState(null)
       const [kbCacheBusy, setKbCacheBusy] = React.useState(false)
       const [kbCacheMsg, setKbCacheMsg] = React.useState(null)
+      /** 危险/重活（更新快照、清空）收进「⋯」菜单，避免顺手点掉。 */
+      const [kbCacheMenu, setKbCacheMenu] = React.useState(false)
+      const [kbCacheConfirm, setKbCacheConfirm] = React.useState(false)
       const [kbQ, setKbQ] = React.useState(snap === null || typeof snap.kbQ !== 'string' ? '' : snap.kbQ)
       const [kbResults, setKbResults] = React.useState(snap === null ? null : snap.kbResults)
       const [kbSearching, setKbSearching] = React.useState(false)
@@ -1080,6 +1087,8 @@ window.__ModuleLoader__.load({
         setFileSel(null)
         setFileInfo(null)
         setKbCacheMsg(null)
+        setKbCacheMenu(false)
+        setKbCacheConfirm(false)
         loadDir(kbId, '', '', false)
       }, [loadDir])
 
@@ -1257,6 +1266,17 @@ window.__ModuleLoader__.load({
         loadKbCache()
       }, [tab, selectedKb, loadKbCache])
 
+      /** 菜单打开时点面板其它地方就收起；菜单自身的 mousedown 会 stopPropagation。 */
+      React.useEffect(() => {
+        if (!kbCacheMenu) return undefined
+        const close = () => {
+          setKbCacheMenu(false)
+          setKbCacheConfirm(false)
+        }
+        document.addEventListener('mousedown', close)
+        return () => document.removeEventListener('mousedown', close)
+      }, [kbCacheMenu])
+
       const runKbSearch = React.useCallback(async (value) => {
         const q = String(value || '').trim()
         if (q === '' || selectedKb === '') {
@@ -1342,27 +1362,72 @@ window.__ModuleLoader__.load({
                           + t.kbCacheStats(cacheEntry.files, cacheEntry.texts, formatBytes(kbCache === null ? 0 : kbCache.bytes))
                         : t.kbCacheNone,
                   ),
-                  h(
-                    'button',
-                    {
-                      className: 'ima-kb-button ima-kb-kbcache-btn',
-                      type: 'button',
-                      disabled: kbCacheBusy,
-                      onClick: runKbCache,
-                    },
-                    cacheEntry !== undefined && cacheEntry.snapshotAt > 0 ? t.kbCacheUpdate : t.kbCacheWarm,
-                  ),
-                  h(
-                    'button',
-                    {
-                      className: 'ima-kb-button ima-kb-kbcache-btn',
-                      type: 'button',
-                      disabled: kbCacheBusy || cacheEntry === undefined || cacheEntry.dirs === 0,
-                      onClick: dropKbCache,
-                    },
-                    t.kbCacheClear,
-                  ),
+                  kbCacheBusy
+                    ? null
+                    : cacheEntry !== undefined && cacheEntry.snapshotAt > 0
+                      ? h(
+                          'button',
+                          {
+                            className: 'ima-kb-kbcache-more',
+                            type: 'button',
+                            title: t.kbCacheMore,
+                            'aria-label': t.kbCacheMore,
+                            'aria-expanded': kbCacheMenu ? 'true' : 'false',
+                            onMouseDown: (event) => event.stopPropagation(),
+                            onClick: () => {
+                              setKbCacheMenu((open) => !open)
+                              setKbCacheConfirm(false)
+                            },
+                          },
+                          '⋯',
+                        )
+                      : h(
+                          'button',
+                          {
+                            className: 'ima-kb-button ima-kb-kbcache-btn',
+                            type: 'button',
+                            onClick: runKbCache,
+                          },
+                          t.kbCacheWarm,
+                        ),
                 ),
+                kbCacheMenu && !kbCacheBusy
+                  ? h(
+                      'div',
+                      { className: 'ima-kb-kbcache-menu', onMouseDown: (event) => event.stopPropagation() },
+                      h(
+                        'button',
+                        {
+                          className: 'ima-kb-kbcache-item',
+                          type: 'button',
+                          onClick: () => {
+                            setKbCacheMenu(false)
+                            setKbCacheConfirm(false)
+                            runKbCache()
+                          },
+                        },
+                        t.kbCacheUpdate,
+                      ),
+                      h(
+                        'button',
+                        {
+                          className: 'ima-kb-kbcache-item ima-kb-kbcache-item-danger',
+                          type: 'button',
+                          onClick: () => {
+                            // 第一下只是把按钮变成「确认清空？」，第二下才真删。
+                            if (!kbCacheConfirm) {
+                              setKbCacheConfirm(true)
+                              return
+                            }
+                            setKbCacheConfirm(false)
+                            setKbCacheMenu(false)
+                            dropKbCache()
+                          },
+                        },
+                        kbCacheConfirm ? t.kbCacheConfirmClear : t.kbCacheClear,
+                      ),
+                    )
+                  : null,
                 kbCacheMsg !== null ? h('div', { className: 'ima-kb-hint' }, kbCacheMsg) : null,
               )
             : h(
@@ -2153,6 +2218,12 @@ window.__ModuleLoader__.load({
       '.ima-kb-kbcache-label{font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary)}',
       '.ima-kb-kbcache-text{flex:1 1 auto;min-width:120px;font-size:11px;color:var(--dsw-alias-label-primary)}',
       '.ima-kb-kbcache-btn{height:24px;padding:0 8px;font-size:11px}',
+      '.ima-kb-kbcache-more{flex:0 0 auto;width:24px;height:24px;padding:0;border-radius:6px;border:1px solid transparent;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer;font-size:14px;line-height:1}',
+      '.ima-kb-kbcache-more:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
+      '.ima-kb-kbcache-menu{display:flex;gap:6px;margin-top:8px;padding-top:8px;border-top:1px solid var(--dsw-alias-border-l1)}',
+      '.ima-kb-kbcache-item{height:24px;padding:0 8px;font-size:11px;border-radius:6px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);cursor:pointer}',
+      '.ima-kb-kbcache-item:hover{background:var(--dsw-alias-bg-layer-2)}',
+      '.ima-kb-kbcache-item-danger{color:#d9534f;border-color:rgba(217,83,79,.45)}',
       '.ima-kb-search{flex:1 1 auto;min-width:0;padding:8px;box-sizing:border-box}',
       '.ima-kb-input{width:100%;height:30px;padding:0 10px;font-size:12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);outline:none;box-sizing:border-box}',
       '.ima-kb-input:focus{border-color:var(--dsw-alias-brand-primary)}',
