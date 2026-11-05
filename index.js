@@ -30,7 +30,7 @@
  *  - get_media_info → 拿到带签名的原文地址，由 /ima-kb/api/kb-raw 代理下载。
  */
 import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, renameSync, rmSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath, pathToFileURL } from 'node:url'
@@ -120,6 +120,21 @@ export const Config = Schema.object({
   autoInstallSkills: Schema.string()
     .default('on')
     .description("插件启动时把随包的技能装到 skillsDir；已存在就不覆盖。填 off 关闭"),
+  kbCacheTtlMinutes: Schema.number()
+    .step(1)
+    .min(1)
+    .max(525600)
+    .default(10080)
+    .description('个人知识库本地缓存保留多久（分钟）。只对「我的知识库」生效，订阅/加入的库不写磁盘'),
+  kbCacheText: Schema.string()
+    .default('on')
+    .description("预热个人知识库时是否连正文一起缓存（md/docx/txt）；填 off 只缓存目录，正文仍按需在线取"),
+  kbCacheMaxFiles: Schema.number()
+    .step(1)
+    .min(1)
+    .max(50000)
+    .default(2000)
+    .description('单个个人知识库最多缓存多少个文件正文；超过就只缓存目录'),
 })
 
 const DEFAULT_CREDENTIALS_DIR = join(homedir(), '.config', 'ima')
@@ -195,6 +210,9 @@ const settings = {
   titleFilter: [],
   skillsDir: '',
   autoInstallSkills: 'on',
+  kbCacheTtlMs: 10080 * 60 * 1000,
+  kbCacheText: 'on',
+  kbCacheMaxFiles: 2000,
 }
 
 function nonEmptyString(value) {
@@ -223,6 +241,9 @@ function resolveSettings(raw) {
   settings.cacheDir = rawCacheDir === '-' ? '' : rawCacheDir || DEFAULT_CACHE_DIR
   settings.skillsDir = nonEmptyString(config.skillsDir)
   settings.autoInstallSkills = config.autoInstallSkills === 'off' ? 'off' : 'on'
+  settings.kbCacheTtlMs = clamp(config.kbCacheTtlMinutes ?? 10080, 1, 525600) * 60 * 1000
+  settings.kbCacheText = config.kbCacheText === 'off' ? 'off' : 'on'
+  settings.kbCacheMaxFiles = clamp(config.kbCacheMaxFiles ?? 2000, 1, 50000)
   settings.titleFilter = String(config.titleFilter ?? '')
     .split(/[,，]/)
     .map((term) => term.trim())
@@ -234,6 +255,7 @@ function resolveSettings(raw) {
   diskLoaded = false
   resetWarmState()
   invalidateKbCaches()
+  resetKbDisk()
 }
 
 /** 随包技能：安装时复制到 skillsDir，已存在则不覆盖（用户可能改过）。 */
@@ -1154,6 +1176,12 @@ function normalizeKbItem(row) {
 /** 列出当前凭证能看到的全部知识库（自动翻页）。 */
 async function listKnowledgeBases() {
   if (kbListCache !== undefined && Date.now() - kbListCache.at < KB_LIST_TTL_MS) return kbListCache.items
+  const fromDisk = diskKbList()
+  if (fromDisk !== undefined) {
+    const entry = kbDisk.list
+    kbListCache = { at: Number(entry.at) || Date.now(), items: fromDisk }
+    return fromDisk
+  }
   const items = []
   let cursor = ''
   for (let page = 0; page < MAX_KB_PAGES; page += 1) {
@@ -1179,7 +1207,20 @@ async function listKnowledgeBases() {
     if (cursor === '') break
   }
   kbListCache = { at: Date.now(), items }
+  saveKbList(items)
   return items
+}
+
+/** 这个 kb_id 是不是个人知识库（列表没缓存时先拉一次列表）。 */
+async function isPersonalKbId(kbId) {
+  const ids = personalKbIdSet()
+  if (ids.size > 0) return ids.has(kbId)
+  try {
+    const kbs = await listKnowledgeBases()
+    return kbs.some((kb) => kb.id === kbId && isPersonalKb(kb))
+  } catch {
+    return false
+  }
 }
 
 /** 列出一个知识库的某个目录（folderId 空 = 根目录）。 */
@@ -1187,6 +1228,12 @@ async function listKbDirectory(kbId, folderId, cursor) {
   const dirKey = `${kbId}|${folderId}|${cursor}`
   const cached = kbDirCache.get(dirKey)
   if (cached !== undefined && Date.now() - cached.at < KB_DIR_TTL_MS) return cached.value
+  // 个人知识库：命中本地快照就直接用，不再打接口（订阅/加入的库没有落盘，走不到这里）。
+  const fromDisk = diskKbDir(kbId, folderId, cursor)
+  if (fromDisk !== undefined) {
+    kbDirCache.set(dirKey, { at: Date.now(), value: fromDisk })
+    return fromDisk
+  }
   const body = { knowledge_base_id: kbId, cursor: cursor ?? '', limit: KB_PAGE_SIZE }
   if (folderId !== undefined && folderId !== '') body.folder_id = folderId
   const data = await imaApi('openapi/wiki/v1/get_knowledge_list', body)
@@ -1208,6 +1255,7 @@ async function listKbDirectory(kbId, folderId, cursor) {
     nextCursor: typeof data?.next_cursor === 'string' ? data.next_cursor : '',
   }
   kbDirCache.set(dirKey, { at: Date.now(), value })
+  if (await isPersonalKbId(kbId)) saveKbDir(kbId, folderId, cursor, value)
   return value
 }
 
@@ -1375,6 +1423,11 @@ function extractDocxText(buffer) {
 async function kbFileText(mediaId, title) {
   const cached = kbTextCache.get(mediaId)
   if (cached !== undefined && Date.now() - cached.at < KB_TEXT_TTL_MS) return cached.value
+  const fromDisk = diskKbText(mediaId)
+  if (fromDisk !== undefined) {
+    kbTextCache.set(mediaId, { at: Date.now(), value: fromDisk })
+    return fromDisk
+  }
   const info = await mediaInfo(mediaId)
   const kind = inferFileKind(title, info.mediaType)
   if (kind === 'pdf') {
@@ -1430,7 +1483,396 @@ async function kbFileText(mediaId, title) {
     inlineUrl: '',
   }
   kbTextCache.set(mediaId, { at: Date.now(), value })
+  // 只有个人知识库的正文落盘；PDF / 未知类型不缓存（离线看重定向代理没有意义）。
+  if (mediaInPersonalKb(mediaId)) saveKbText(mediaId, value)
   return value
+}
+
+// ── 个人知识库本地缓存（只缓存「我的知识库」） ──────────────────────────
+/**
+ * 落盘范围只有两类：**笔记正文**（上面的 content-*.json）和**个人知识库**
+ * （base_type = 个人知识库）。订阅 / 加入的共享知识库（base_type = 我加入的订阅知识库）
+ * 一律不写磁盘——那种库动辄几十万上百万文件，抓一遍要几小时，而且随时在变。
+ *
+ * 注意 ima 的 get_knowledge_list 不返回 modify_time，所以这里没有「增量」可言：
+ * 是否过期只看 TTL（默认 7 天），过期后靠手动「更新」或重新预热再拉一遍。
+ */
+const KB_DISK_VERSION = 1
+
+let kbDisk = null
+let kbDiskLoaded = false
+let kbDiskTimer
+let kbSaveSuppressed = 0
+
+/** 是不是「我的知识库」：ima 用 base_type 区分，role_type 兜底。 */
+function isPersonalKb(item) {
+  if (item === null || typeof item !== 'object') return false
+  if (item.baseType === '个人知识库') return true
+  const role = typeof item.role === 'string' ? item.role : ''
+  return role.includes('创建者') || role.toLowerCase().includes('owner')
+}
+
+function kbCacheFile() {
+  if (settings.cacheDir === '') return ''
+  let clientId = ''
+  try {
+    clientId = credentialState().clientId
+  } catch {
+    clientId = ''
+  }
+  const key = createHash('sha256').update(settings.baseUrl + '|' + clientId).digest('hex').slice(0, 16)
+  return join(settings.cacheDir, 'kb-' + key + '.json')
+}
+
+function emptyKbDisk() {
+  return { version: KB_DISK_VERSION, baseUrl: settings.baseUrl, savedAt: 0, list: undefined, dirs: {}, texts: {}, snaps: {} }
+}
+
+function ensureKbDiskLoaded() {
+  if (kbDiskLoaded) return
+  kbDiskLoaded = true
+  kbDisk = emptyKbDisk()
+  const file = kbCacheFile()
+  if (file === '') return
+  let payload
+  try {
+    payload = JSON.parse(readFileSync(file, 'utf8'))
+  } catch {
+    return
+  }
+  if (payload === null || typeof payload !== 'object') return
+  if (payload.version !== KB_DISK_VERSION || payload.baseUrl !== settings.baseUrl) return
+  kbDisk.savedAt = Number(payload.savedAt) || 0
+  if (payload.list !== null && typeof payload.list === 'object') kbDisk.list = payload.list
+  if (payload.dirs !== null && typeof payload.dirs === 'object') kbDisk.dirs = payload.dirs
+  if (payload.texts !== null && typeof payload.texts === 'object') kbDisk.texts = payload.texts
+  if (payload.snaps !== null && typeof payload.snaps === 'object') kbDisk.snaps = payload.snaps
+}
+
+function kbFresh(entry) {
+  if (entry === null || typeof entry !== 'object') return false
+  const at = Number(entry.at) || 0
+  return at > 0 && Date.now() - at < settings.kbCacheTtlMs
+}
+
+function writeKbDisk() {
+  const file = kbCacheFile()
+  if (file === '') return
+  const disk = kbDisk === null ? emptyKbDisk() : kbDisk
+  const texts = {}
+  for (const [mediaId, entry] of Object.entries(disk.texts ?? {})) {
+    if (kbFresh(entry)) texts[mediaId] = entry
+  }
+  const dirs = {}
+  for (const [kbId, folders] of Object.entries(disk.dirs ?? {})) {
+    const kept = {}
+    for (const [key, entry] of Object.entries(folders ?? {})) {
+      if (kbFresh(entry)) kept[key] = entry
+    }
+    if (Object.keys(kept).length > 0) dirs[kbId] = kept
+  }
+  const payload = JSON.stringify({
+    version: KB_DISK_VERSION,
+    baseUrl: settings.baseUrl,
+    savedAt: Date.now(),
+    list: disk.list,
+    dirs,
+    texts,
+    snaps: disk.snaps ?? {},
+  })
+  try {
+    mkdirSync(settings.cacheDir, { recursive: true })
+    const temp = file + '.tmp-' + process.pid
+    writeFileSync(temp, payload, 'utf8')
+    renameSync(temp, file)
+    if (kbDisk !== null) {
+      kbDisk.dirs = dirs
+      kbDisk.texts = texts
+      kbDisk.savedAt = Date.now()
+    }
+  } catch {
+    try {
+      rmSync(file + '.tmp-' + process.pid, { force: true })
+    } catch {
+      // 写缓存失败不影响在线读取。
+    }
+  }
+}
+
+function scheduleKbSave() {
+  if (settings.cacheDir === '') return
+  if (kbSaveSuppressed > 0) return
+  if (kbDiskTimer !== undefined) return
+  kbDiskTimer = setTimeout(() => {
+    kbDiskTimer = undefined
+    writeKbDisk()
+  }, 4000)
+  if (typeof kbDiskTimer.unref === 'function') kbDiskTimer.unref()
+}
+
+function flushKbSave() {
+  if (kbDiskTimer !== undefined) {
+    clearTimeout(kbDiskTimer)
+    kbDiskTimer = undefined
+  }
+  writeKbDisk()
+}
+
+function resetKbDisk() {
+  if (kbDiskTimer !== undefined) {
+    clearTimeout(kbDiskTimer)
+    kbDiskTimer = undefined
+  }
+  kbDisk = null
+  kbDiskLoaded = false
+}
+
+/** 知识库列表也落盘：重启后 /kb 直接有内容，不用先打一次接口。 */
+function saveKbList(items) {
+  ensureKbDiskLoaded()
+  if (kbDisk === null) return
+  kbDisk.list = { at: Date.now(), items }
+  scheduleKbSave()
+}
+
+function diskKbList() {
+  ensureKbDiskLoaded()
+  const entry = kbDisk === null ? undefined : kbDisk.list
+  if (!kbFresh(entry)) return undefined
+  return Array.isArray(entry.items) ? entry.items : undefined
+}
+
+function kbDirKeyOf(folderId, cursor) {
+  return String(cursor ?? '') + '|' + String(folderId ?? '')
+}
+
+function saveKbDir(kbId, folderId, cursor, value) {
+  ensureKbDiskLoaded()
+  if (kbDisk === null) return
+  const folders = kbDisk.dirs[kbId] ?? {}
+  folders[kbDirKeyOf(folderId, cursor)] = { at: Date.now(), value }
+  kbDisk.dirs[kbId] = folders
+  scheduleKbSave()
+}
+
+function diskKbDir(kbId, folderId, cursor) {
+  ensureKbDiskLoaded()
+  const folders = kbDisk === null ? undefined : kbDisk.dirs[kbId]
+  if (folders === undefined) return undefined
+  const entry = folders[kbDirKeyOf(folderId, cursor)]
+  if (!kbFresh(entry)) return undefined
+  return entry.value
+}
+
+function saveKbText(mediaId, value) {
+  ensureKbDiskLoaded()
+  if (kbDisk === null) return
+  kbDisk.texts[mediaId] = { at: Date.now(), value }
+  scheduleKbSave()
+}
+
+function diskKbText(mediaId) {
+  ensureKbDiskLoaded()
+  const entry = kbDisk === null ? undefined : kbDisk.texts[mediaId]
+  if (!kbFresh(entry)) return undefined
+  return entry.value
+}
+
+/** 当前能判定为「个人知识库」的 id 集合（内存列表优先，其次磁盘快照）。 */
+function personalKbIdSet() {
+  const ids = new Set()
+  const source = (kbListCache !== undefined && Array.isArray(kbListCache.items) ? kbListCache.items : undefined)
+    ?? (kbDisk !== null && kbDisk.list !== null && Array.isArray(kbDisk.list.items) ? kbDisk.list.items : [])
+  for (const kb of source) {
+    if (isPersonalKb(kb)) ids.add(kb.id)
+  }
+  return ids
+}
+
+/** 这个文件是不是挂在某个个人知识库下（决定正文要不要落盘）。 */
+function mediaInPersonalKb(mediaId) {
+  ensureKbDiskLoaded()
+  const ids = personalKbIdSet()
+  if (ids.size === 0) return false
+  const has = (items) => Array.isArray(items) && items.some((item) => item.mediaId === mediaId)
+  for (const kbId of ids) {
+    const folders = kbDisk === null ? undefined : kbDisk.dirs[kbId]
+    if (folders === undefined) continue
+    for (const entry of Object.values(folders)) {
+      const items = entry !== null && typeof entry === 'object' && entry.value !== null && typeof entry.value === 'object' ? entry.value.items : undefined
+      if (has(items)) return true
+    }
+  }
+  for (const [dirKey, entry] of kbDirCache) {
+    if (!ids.has(dirKey.split('|')[0])) continue
+    const items = entry !== null && typeof entry === 'object' && entry.value !== null && typeof entry.value === 'object' ? entry.value.items : undefined
+    if (has(items)) return true
+  }
+  return false
+}
+
+/** 预热进度：面板用它显示「正在缓存目录 / 正文」。 */
+const kbWarmState = { running: false, kbId: '', kbName: '', stage: '', total: 0, done: 0, failed: 0, folderCount: 0, fileCount: 0, startedAt: 0, finishedAt: 0 }
+let kbWarmPromise
+
+function kbWarmSnapshot() {
+  return { ...kbWarmState }
+}
+
+function resetKbWarmState() {
+  Object.assign(kbWarmState, { running: false, kbId: '', kbName: '', stage: '', total: 0, done: 0, failed: 0, folderCount: 0, fileCount: 0, startedAt: 0, finishedAt: 0 })
+}
+
+/**
+ * 把一个个人知识库整棵缓存下来：先逐层翻页拉目录，再（默认）把 md/docx/txt 的正文取回。
+ * 订阅 / 加入的库直接拒绝——它们仍然按原来的方式在线读。
+ */
+function warmPersonalKb(kbId) {
+  if (kbWarmPromise !== undefined) return kbWarmPromise
+  const run = (async () => {
+    const kbs = await listKnowledgeBases()
+    const kb = kbs.find((item) => item.id === kbId)
+    if (kb === undefined) throw new Error('没有 kb_id=' + kbId + ' 的知识库，先用 kb_space_list 看 id')
+    if (!isPersonalKb(kb)) {
+      throw new Error('「' + kb.name + '」不是个人知识库：订阅 / 加入的共享知识库不做本地缓存，仍按原来的方式在线读取。')
+    }
+    Object.assign(kbWarmState, {
+      running: true, kbId, kbName: kb.name, stage: 'list',
+      total: 0, done: 0, failed: 0, folderCount: 0, fileCount: 0, startedAt: Date.now(), finishedAt: 0,
+    })
+    ensureKbDiskLoaded()
+    kbSaveSuppressed += 1
+    const folderQueue = ['']
+    const files = []
+    let cachedTexts = 0
+    let failed = 0
+    try {
+      while (folderQueue.length > 0) {
+        const folderId = folderQueue.shift()
+        let cursor = ''
+        for (;;) {
+          const dir = await listKbDirectory(kbId, folderId, cursor)
+          kbWarmState.folderCount += 1
+          for (const item of dir.items) {
+            if (item.folder) folderQueue.push(item.mediaId)
+            else files.push(item)
+          }
+          kbWarmState.fileCount = files.length
+          if (dir.isEnd === true || dir.nextCursor === '') break
+          cursor = dir.nextCursor
+        }
+      }
+      const textTargets = settings.kbCacheText === 'on'
+        ? files.filter((item) => {
+          const kind = inferFileKind(item.title, item.type)
+          return kind === 'markdown' || kind === 'docx' || kind === 'text'
+        }).slice(0, settings.kbCacheMaxFiles)
+        : []
+      kbWarmState.stage = textTargets.length > 0 ? 'text' : 'done'
+      kbWarmState.total = textTargets.length
+      kbWarmState.done = 0
+      for (const item of textTargets) {
+        try {
+          const value = await kbFileText(item.mediaId, item.title)
+          saveKbText(item.mediaId, value)
+          cachedTexts += 1
+        } catch {
+          failed += 1
+        }
+        kbWarmState.done += 1
+      }
+      kbWarmState.failed = failed
+      if (kbDisk !== null) {
+        kbDisk.snaps = kbDisk.snaps ?? {}
+        kbDisk.snaps[kbId] = { at: Date.now(), folders: kbWarmState.folderCount, files: files.length, texts: cachedTexts }
+      }
+      let bytes = 0
+      const cachePath = kbCacheFile()
+      if (cachePath !== '') {
+        try {
+          bytes = statSync(cachePath).size
+        } catch {
+          bytes = 0
+        }
+      }
+      return { kbId, name: kb.name, folders: kbWarmState.folderCount, files: files.length, texts: cachedTexts, failed, bytes }
+    } finally {
+      kbSaveSuppressed -= 1
+      flushKbSave()
+      kbWarmState.running = false
+      kbWarmState.finishedAt = Date.now()
+      kbWarmState.stage = 'done'
+    }
+  })()
+  kbWarmPromise = run
+  run.then(
+    () => { if (kbWarmPromise === run) kbWarmPromise = undefined },
+    () => { if (kbWarmPromise === run) kbWarmPromise = undefined },
+  )
+  return run
+}
+
+/** 缓存状态：给面板和 /kb-cache 用。 */
+function kbCacheStatus() {
+  ensureKbDiskLoaded()
+  const file = kbCacheFile()
+  let bytes = 0
+  if (file !== '') {
+    try {
+      bytes = statSync(file).size
+    } catch {
+      bytes = 0
+    }
+  }
+  const source = (kbListCache !== undefined && Array.isArray(kbListCache.items) ? kbListCache.items : undefined)
+    ?? (kbDisk !== null && kbDisk.list !== null && Array.isArray(kbDisk.list.items) ? kbDisk.list.items : [])
+  const snaps = kbDisk === null ? {} : (kbDisk.snaps ?? {})
+  return {
+    enabled: settings.cacheDir !== '',
+    ttlMinutes: Math.round(settings.kbCacheTtlMs / 60000),
+    textMode: settings.kbCacheText,
+    maxFiles: settings.kbCacheMaxFiles,
+    file,
+    bytes,
+    savedAt: kbDisk === null ? 0 : kbDisk.savedAt,
+    warm: kbWarmSnapshot(),
+    kbs: source.map((kb) => {
+      const snap = snaps[kb.id] !== null && typeof snaps[kb.id] === 'object' ? snaps[kb.id] : undefined
+      const folders = kbDisk === null ? undefined : kbDisk.dirs[kb.id]
+      let dirs = 0
+      if (folders !== undefined) {
+        for (const entry of Object.values(folders)) {
+          if (kbFresh(entry)) dirs += 1
+        }
+      }
+      return {
+        id: kb.id,
+        name: kb.name,
+        personal: isPersonalKb(kb),
+        dirs,
+        snapshotAt: snap === undefined ? 0 : (Number(snap.at) || 0),
+        folders: snap === undefined ? 0 : (Number(snap.folders) || 0),
+        files: snap === undefined ? 0 : (Number(snap.files) || 0),
+        texts: snap === undefined ? 0 : (Number(snap.texts) || 0),
+      }
+    }),
+  }
+}
+
+/** 清空本地缓存：内存 + 磁盘。只作用于缓存文件，不碰 ima 上的任何数据。 */
+function clearKbCache() {
+  resetKbDisk()
+  const file = kbCacheFile()
+  if (file !== '') {
+    try {
+      rmSync(file, { force: true })
+    } catch {
+      // 删不掉就算了，内存已经清了。
+    }
+  }
+  kbDirCache.clear()
+  kbTextCache.clear()
+  resetKbWarmState()
 }
 
 // ── 笔记官方检索（分词召回，弥补本地字面检索「换一种说法就搜不到」） ──
@@ -1970,6 +2412,29 @@ function registerRoutes(ctx) {
       // ── 知识库（wiki）──
       if (route === 'kb') {
         sendJson(res, 200, { items: await listKnowledgeBases() })
+        return
+      }
+      // 个人知识库本地缓存：状态 / 预热 / 清空
+      if (route === 'kb-cache') {
+        if (url.searchParams.get('clear') === '1') clearKbCache()
+        sendJson(res, 200, kbCacheStatus())
+        return
+      }
+      if (route === 'kb-warm') {
+        const kbId = url.searchParams.get('kb') ?? ''
+        if (kbId === '') {
+          sendJson(res, 400, { error: 'missing kb' })
+          return
+        }
+        try {
+          sendJson(res, 200, await warmPersonalKb(kbId))
+        } catch (error) {
+          sendJson(res, 200, { error: error instanceof Error ? error.message : String(error) })
+        }
+        return
+      }
+      if (route === 'kb-warm-status') {
+        sendJson(res, 200, kbWarmSnapshot())
         return
       }
       if (route === 'kb-files') {

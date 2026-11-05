@@ -95,6 +95,17 @@ window.__ModuleLoader__.load({
         kbRoot: '根目录',
         kbLoadMore: '加载更多',
         kbBack: '返回上一级',
+        // 个人知识库本地缓存
+        kbCacheTitle: '本地缓存',
+        kbCacheNone: '还没缓存到本地。缓存后断网也能翻目录和看正文。',
+        kbCacheStats: (files, texts, size) => `${files} 个文件${texts > 0 ? ` · ${texts} 篇正文` : ''} · ${size}`,
+        kbCacheAt: (when) => `快照 ${when}`,
+        kbCacheWarm: '缓存到本地',
+        kbCacheUpdate: '更新快照',
+        kbCacheClear: '清空',
+        kbCacheWarming: (stage, done, total) => stage === 'text' ? `正在缓存正文 ${done}/${total}` : '正在缓存目录…',
+        kbCacheDone: (files, texts, failed) => `已缓存 ${files} 个文件${texts > 0 ? `、${texts} 篇正文` : ''}${failed > 0 ? `，${failed} 篇失败` : ''}`,
+        kbCacheShared: '订阅 / 加入的知识库不做本地缓存，按需在线读取。',
         kbDownload: '下载原文',
         kbDownloading: '正在准备下载…',
         kbNoDownload: '这个文件没有可下载的原文。',
@@ -178,6 +189,16 @@ window.__ModuleLoader__.load({
         kbRoot: 'Root',
         kbLoadMore: 'Load more',
         kbBack: 'Up one level',
+        kbCacheTitle: 'Local cache',
+        kbCacheNone: 'Not cached yet. Cached spaces stay browsable offline.',
+        kbCacheStats: (files, texts, size) => `${files} files${texts > 0 ? ` · ${texts} texts` : ''} · ${size}`,
+        kbCacheAt: (when) => `snapshot ${when}`,
+        kbCacheWarm: 'Cache locally',
+        kbCacheUpdate: 'Refresh snapshot',
+        kbCacheClear: 'Clear',
+        kbCacheWarming: (stage, done, total) => stage === 'text' ? `Caching texts ${done}/${total}` : 'Caching folders…',
+        kbCacheDone: (files, texts, failed) => `Cached ${files} files${texts > 0 ? `, ${texts} texts` : ''}${failed > 0 ? `, ${failed} failed` : ''}`,
+        kbCacheShared: 'Subscribed / joined spaces are not cached locally; they stay online-only.',
         kbDownload: 'Download original',
         kbDownloading: 'Preparing download…',
         kbNoDownload: 'This file has no downloadable original.',
@@ -284,6 +305,25 @@ window.__ModuleLoader__.load({
     function formatNumber(value) {
       if (value === null || value === undefined) return null
       return Number(value).toLocaleString('en-US')
+    }
+
+    /** 缓存占用：1 位小数就够，别在面板里堆数字。 */
+    function formatBytes(value) {
+      const bytes = Number(value) || 0
+      if (bytes <= 0) return '0 B'
+      if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
+      return (bytes / (1024 * 1024)).toFixed(1) + ' MB'
+    }
+
+    /** 本地快照时间：月-日 时:分。 */
+    function formatSnapshot(at) {
+      const stamp = Number(at) || 0
+      if (stamp <= 0) return ''
+      try {
+        return new Date(stamp).toLocaleString(undefined, { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
+      } catch {
+        return ''
+      }
     }
 
     /**
@@ -580,6 +620,9 @@ window.__ModuleLoader__.load({
       const [dirLoading, setDirLoading] = React.useState(false)
       const [dirLoadingMore, setDirLoadingMore] = React.useState(false)
       const [dirError, setDirError] = React.useState(null)
+      const [kbCache, setKbCache] = React.useState(null)
+      const [kbCacheBusy, setKbCacheBusy] = React.useState(false)
+      const [kbCacheMsg, setKbCacheMsg] = React.useState(null)
       const [kbQ, setKbQ] = React.useState(snap === null || typeof snap.kbQ !== 'string' ? '' : snap.kbQ)
       const [kbResults, setKbResults] = React.useState(snap === null ? null : snap.kbResults)
       const [kbSearching, setKbSearching] = React.useState(false)
@@ -1036,8 +1079,49 @@ window.__ModuleLoader__.load({
         setKbQ('')
         setFileSel(null)
         setFileInfo(null)
+        setKbCacheMsg(null)
         loadDir(kbId, '', '', false)
       }, [loadDir])
+
+      // ── 个人知识库的本地缓存 ──
+      const loadKbCache = React.useCallback(async () => {
+        try {
+          setKbCache(await getJson(API + '/kb-cache'))
+        } catch {
+          setKbCache(null)
+        }
+      }, [])
+
+      const runKbCache = React.useCallback(async () => {
+        if (selectedKb === '') return
+        setKbCacheBusy(true)
+        setKbCacheMsg(null)
+        const timer = setInterval(() => { loadKbCache() }, 2000)
+        try {
+          const result = await getJson(API + '/kb-warm?kb=' + encodeURIComponent(selectedKb))
+          if (result && typeof result.error === 'string') setKbCacheMsg(result.error)
+          else if (result && typeof result.files === 'number') {
+            setKbCacheMsg(t.kbCacheDone(result.files, result.texts || 0, result.failed || 0))
+          }
+        } catch (error) {
+          setKbCacheMsg(describeError(error, t))
+        } finally {
+          clearInterval(timer)
+          setKbCacheBusy(false)
+          loadKbCache()
+        }
+      }, [selectedKb, loadKbCache, t])
+
+      const dropKbCache = React.useCallback(async () => {
+        try {
+          await getJson(API + '/kb-cache?clear=1')
+        } catch {
+          // 清不掉就下次再说。
+        }
+        setKbCacheMsg(null)
+        await loadKbCache()
+        if (selectedKb !== '') loadDir(selectedKb, dirFolderId, '', false)
+      }, [loadKbCache, loadDir, selectedKb, dirFolderId])
 
       const selectFile = React.useCallback(async (item, folderLabel) => {
         setFileSel(item)
@@ -1167,6 +1251,12 @@ window.__ModuleLoader__.load({
         loadDir(selectedKb, '', '', false)
       }, [tab, kbs, selectedKb, dirItems, dirLoading, dirError, loadDir])
 
+      /** 缓存状态：只在知识库页签需要，切库时重新读一次。 */
+      React.useEffect(() => {
+        if (tab !== 'kb' || selectedKb === '') return
+        loadKbCache()
+      }, [tab, selectedKb, loadKbCache])
+
       const runKbSearch = React.useCallback(async (value) => {
         const q = String(value || '').trim()
         if (q === '' || selectedKb === '') {
@@ -1221,6 +1311,66 @@ window.__ModuleLoader__.load({
       React.useEffect(() => () => {
         panelSnapshot = { ...snapshotRef.current, scrollTop: liveScrollRef.current }
       }, [])
+
+      const currentKb = Array.isArray(kbs) ? kbs.find((item) => item.id === selectedKb) : undefined
+      const personalKb = currentKb !== undefined
+        && (currentKb.baseType === '个人知识库' || String(currentKb.role || '').includes('创建者'))
+      const cacheEntry = kbCache !== null && Array.isArray(kbCache.kbs)
+        ? kbCache.kbs.find((item) => item.id === selectedKb)
+        : undefined
+      const cacheStrip = tab === 'kb' && selectedKb !== ''
+        ? (personalKb
+            ? h(
+                'div',
+                { className: 'ima-kb-kbcache' },
+                h(
+                  'div',
+                  { className: 'ima-kb-kbcache-row' },
+                  h('span', { className: 'ima-kb-kbcache-label' }, t.kbCacheTitle),
+                  h(
+                    'span',
+                    { className: 'ima-kb-kbcache-text' },
+                    kbCacheBusy
+                      ? t.kbCacheWarming(
+                          kbCache !== null && kbCache.warm !== null && typeof kbCache.warm === 'object' ? kbCache.warm.stage : 'list',
+                          kbCache !== null && kbCache.warm !== null && typeof kbCache.warm === 'object' ? kbCache.warm.done : 0,
+                          kbCache !== null && kbCache.warm !== null && typeof kbCache.warm === 'object' ? kbCache.warm.total : 0,
+                        )
+                      : cacheEntry !== undefined && cacheEntry.snapshotAt > 0
+                        ? t.kbCacheAt(formatSnapshot(cacheEntry.snapshotAt))
+                          + ' · '
+                          + t.kbCacheStats(cacheEntry.files, cacheEntry.texts, formatBytes(kbCache === null ? 0 : kbCache.bytes))
+                        : t.kbCacheNone,
+                  ),
+                  h(
+                    'button',
+                    {
+                      className: 'ima-kb-button ima-kb-kbcache-btn',
+                      type: 'button',
+                      disabled: kbCacheBusy,
+                      onClick: runKbCache,
+                    },
+                    cacheEntry !== undefined && cacheEntry.snapshotAt > 0 ? t.kbCacheUpdate : t.kbCacheWarm,
+                  ),
+                  h(
+                    'button',
+                    {
+                      className: 'ima-kb-button ima-kb-kbcache-btn',
+                      type: 'button',
+                      disabled: kbCacheBusy || cacheEntry === undefined || cacheEntry.dirs === 0,
+                      onClick: dropKbCache,
+                    },
+                    t.kbCacheClear,
+                  ),
+                ),
+                kbCacheMsg !== null ? h('div', { className: 'ima-kb-hint' }, kbCacheMsg) : null,
+              )
+            : h(
+                'div',
+                { className: 'ima-kb-kbcache ima-kb-kbcache-shared' },
+                h('span', { className: 'ima-kb-kbcache-text' }, t.kbCacheShared),
+              ))
+        : null
 
       const groups = React.useMemo(() => buildGroups(notes), [notes])
       const totalChars = React.useMemo(() => {
@@ -1636,6 +1786,7 @@ window.__ModuleLoader__.load({
                               ),
                             )
                           : null,
+                        cacheStrip,
                         dirItems === null
                           ? h(
                               'div',
@@ -1996,6 +2147,12 @@ window.__ModuleLoader__.load({
       '.ima-kb-tab{height:26px;padding:0 12px;font-size:12px;border:none;border-radius:8px;background:transparent;color:var(--dsw-alias-label-secondary);cursor:pointer}',
       '.ima-kb-tab[data-active="true"]{background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);font-weight:600;box-shadow:0 1px 2px rgba(0,0,0,.08)}',
       '.ima-kb-tab:hover{color:var(--dsw-alias-label-primary)}',
+      '.ima-kb-kbcache{margin:8px;padding:8px 10px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1)}',
+      '.ima-kb-kbcache-shared{color:var(--dsw-alias-label-secondary);font-size:11px}',
+      '.ima-kb-kbcache-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
+      '.ima-kb-kbcache-label{font-size:11px;font-weight:600;color:var(--dsw-alias-label-secondary)}',
+      '.ima-kb-kbcache-text{flex:1 1 auto;min-width:120px;font-size:11px;color:var(--dsw-alias-label-primary)}',
+      '.ima-kb-kbcache-btn{height:24px;padding:0 8px;font-size:11px}',
       '.ima-kb-search{flex:1 1 auto;min-width:0;padding:8px;box-sizing:border-box}',
       '.ima-kb-input{width:100%;height:30px;padding:0 10px;font-size:12px;border-radius:8px;border:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);color:var(--dsw-alias-label-primary);outline:none;box-sizing:border-box}',
       '.ima-kb-input:focus{border-color:var(--dsw-alias-brand-primary)}',

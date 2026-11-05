@@ -312,8 +312,11 @@ check('kb_space_search 返回结果', spaceSearchText.includes('media_id:') || s
 console.log('=== /refresh ===')
 const refresh = await call('/ima-kb/api/refresh')
 check('/refresh 200', refresh.status === 200 && refresh.body.ok === true, JSON.stringify(refresh.body))
+// /refresh 清内存缓存和笔记正文缓存；个人知识库的本地快照（kb-*.json）按设计保留，
+// 要清它得显式调 kb-cache?clear=1。
 const afterRefreshFiles = existsSync(cacheDir) ? readdirSync(cacheDir).filter((name) => name.endsWith('.json')) : []
-check('refresh 清掉磁盘缓存', afterRefreshFiles.length === 0, JSON.stringify(afterRefreshFiles))
+const noteCacheFiles = afterRefreshFiles.filter((name) => name.startsWith('content-'))
+check('refresh 清掉笔记正文缓存', noteCacheFiles.length === 0, JSON.stringify(afterRefreshFiles))
 const notesAgain = await call('/ima-kb/api/notes')
 const stateAfter = await call('/ima-kb/api/state')
 check('refresh 后仍能重新翻页', (notesAgain.body.notes || []).length === stateAfter.body.noteCount, `${(notesAgain.body.notes || []).length} vs ${stateAfter.body.noteCount}`)
@@ -361,6 +364,49 @@ const mod4 = await import(`${pluginPath.href}?boot=4`)
 mod4.apply(boot4.ctx, { cacheDir, skillsDir: offSkillsDir, autoInstallSkills: 'off' })
 check('autoInstallSkills=off 不安装', !existsSync(join(offSkillsDir, 'market-research', 'SKILL.md')), offSkillsDir)
 
+
+// ── 9. 个人知识库本地缓存（v2.4.0）──────────────────────────────────────
+//   只缓存「个人知识库」；订阅 / 加入的共享库必须仍然在线读取。
+console.log('=== kb local cache ===')
+const kbCacheDir = join(testDir, 'cache-kb')
+rmSync(kbCacheDir, { recursive: true, force: true })
+const boot5 = makeContext()
+const mod5 = await import(`${pluginPath.href}?boot=5`)
+// 只缓存目录，避免在测试里下几 MB 正文
+mod5.apply(boot5.ctx, { cacheDir: kbCacheDir, skillsDir, kbCacheText: 'off' })
+const call5 = makeCaller(boot5.routes[0])
+const list5 = await call5('/ima-kb/api/kb')
+const items5 = Array.isArray(list5.body.items) ? list5.body.items : []
+const personal5 = items5.filter((item) => item.baseType === '个人知识库' && item.count <= 500)
+const shared5 = items5.filter((item) => item.baseType !== '个人知识库')
+if (personal5.length === 0) {
+  console.log('SKIP 个人知识库本地缓存（该账号没有小体量的个人知识库）')
+} else {
+  const target5 = personal5[0]
+  const warm5 = await call5('/ima-kb/api/kb-warm?kb=' + encodeURIComponent(target5.id))
+  check('kb-warm 200', warm5.status === 200, String(warm5.status))
+  check('kb-warm 缓存了目录', typeof warm5.body.files === 'number' && warm5.body.files > 0, JSON.stringify(warm5.body).slice(0, 120))
+  const status5 = await call5('/ima-kb/api/kb-cache')
+  const entry5 = (status5.body.kbs || []).find((item) => item.id === target5.id)
+  check('kb-cache 记录快照', entry5 !== undefined && entry5.dirs > 0 && entry5.files > 0, JSON.stringify(entry5))
+  check('kb-cache 写入了磁盘文件', status5.body.bytes > 0, String(status5.body.bytes))
+  // 掐断网络：个人库要还能列目录，共享库必须失败
+  const realFetch5 = globalThis.fetch
+  globalThis.fetch = () => { throw new Error('NETWORK_OFF') }
+  try {
+    const offline5 = await call5('/ima-kb/api/kb-files?kb=' + encodeURIComponent(target5.id))
+    check('断网后个人库仍能列目录', offline5.status === 200 && Array.isArray(offline5.body.items) && offline5.body.items.length > 0, JSON.stringify(offline5.body).slice(0, 120))
+    if (shared5.length > 0) {
+      const offlineShared5 = await call5('/ima-kb/api/kb-files?kb=' + encodeURIComponent(shared5[0].id))
+      check('断网后共享库不会用本地缓存（按预期失败）', offlineShared5.status !== 200 || offlineShared5.body.items === undefined, (offlineShared5.body && offlineShared5.body.error) || 'unexpected cache')
+    }
+  } finally {
+    globalThis.fetch = realFetch5
+  }
+  const cleared5 = await call5('/ima-kb/api/kb-cache?clear=1')
+  check('kb-cache?clear=1 清空', cleared5.status === 200 && cleared5.body.bytes === 0, String(cleared5.body.bytes))
+}
+rmSync(kbCacheDir, { recursive: true, force: true })
 rmSync(runnerDir, { recursive: true, force: true })
 rmSync(cacheDir, { recursive: true, force: true })
 rmSync(skillsDir, { recursive: true, force: true })

@@ -203,12 +203,40 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
 | `GET /ima-kb/api/note?id=&start=&length=` | 正文切片 |
 | `GET /ima-kb/api/search?q=&limit=` | 检索结果 |
 | `GET /ima-kb/api/find?q=&start=` | ima 官方分词检索（kb_find 同款） |
-| `GET /ima-kb/api/refresh` | 清缓存（列表 + 正文 + 凭证 + 知识库目录） |
+| `GET /ima-kb/api/refresh` | 清内存缓存（列表 + 正文 + 凭证 + 知识库目录）；个人知识库的**本地快照**不动，要清用 `kb-cache?clear=1` |
 | `GET /ima-kb/api/kb` | 知识库列表（id、名称、文件数、说明、角色） |
 | `GET /ima-kb/api/kb-files?kb=&folder=&cursor=` | 目录内容 + 面包屑（文件夹 99 / PDF 1 / Word 3） |
 | `GET /ima-kb/api/kb-search?kb=&q=` | 按文件名检索（不搜正文） |
 | `GET /ima-kb/api/kb-file?media_id=` | 文件详情与可下载性 |
 | `GET /ima-kb/api/kb-raw?media_id=&title=` | 代理下载带签名的原始文件 |
+| `GET /ima-kb/api/kb-cache` | 个人知识库缓存状态（占用、每个库的快照时间/文件数/正文数）；`?clear=1` 清空 |
+| `GET /ima-kb/api/kb-warm?kb=` | 把一个**个人知识库**整棵缓存到本地，**阻塞到取完** |
+| `GET /ima-kb/api/kb-warm-status` | 缓存进度快照：`running/stage/done/total/folderCount/fileCount` |
+
+## 7.5 个人知识库本地缓存（v2.4.0 起）
+
+**只缓存两样东西：笔记，和你自己的「个人知识库」。** 订阅 / 加入的共享知识库（如「宏观研报精选」「深证信公告库」）**不写磁盘**，仍然按原来的方式在线读取——那种库动辄几十万上百万文件，抓一遍要几小时，缓存没有意义。
+
+判定依据是 ima 返回的 `base_type`：
+
+| base_type | 例子 | 是否缓存 |
+|---|---|---|
+| `个人知识库` | 杰尼龟的知识库（Markdown 版） | ✅ 目录 + 正文 |
+| `我加入的订阅知识库` | 宏观研报精选、深证信 | ❌ 在线读取（内存缓存 5/2/10 分钟照旧） |
+
+缓存到 `~/.dsh/cache/ima-kb-panel/kb-<hash>.json`，包含知识库列表、个人库的整棵目录树、以及 md/docx/txt 的正文文本（PDF 不缓存：内嵌查看走签名地址，离线没有意义）。
+
+面板「知识库」页签顶部会显示 **本地快照时间 / 文件数 / 占用**，三个按钮：**缓存到本地**、**更新快照**、**清空**。缓存完成后，断网也能翻目录、读正文；订阅库断网时仍会报错（这是预期行为）。
+
+配置项：
+
+| 配置 | 默认 | 作用 |
+|---|---|---|
+| `kbCacheTtlMinutes` | 10080（7 天） | 个人库缓存保留多久 |
+| `kbCacheText` | `on` | 预热时是否连正文一起缓存；`off` 只存目录 |
+| `kbCacheMaxFiles` | 2000 | 单个个人库最多缓存多少篇正文 |
+
+> ⚠️ ima 的 `get_knowledge_list` **没有 modify_time**，所以这里没有「增量」：过期与否只看 TTL，想拿最新版就点「更新快照」。面板显示的快照时间就是这份数据的年龄。
 
 ## 8. 故障排查
 
