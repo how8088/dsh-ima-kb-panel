@@ -95,6 +95,10 @@ window.__ModuleLoader__.load({
         kbCopyId: '复制',
         kbCopied: '已复制',
         kbTypes: { 99: '文件夹', 1: 'PDF', 3: 'Word' },
+        fileReading: '正在读取正文…',
+        fileReadFailed: '读取失败：',
+        fileNotReadable: '这种格式面板里看不了，点「下载原文」用本地软件打开。',
+        fileTruncated: (chars) => `正文较长，这里只显示开头部分（共 ${chars} 字）；完整内容请点「下载原文」。`,
       },
       en: {
         title: 'ima Knowledge Base',
@@ -158,6 +162,10 @@ window.__ModuleLoader__.load({
         kbCopyId: 'Copy',
         kbCopied: 'Copied',
         kbTypes: { 99: 'Folder', 1: 'PDF', 3: 'Word' },
+        fileReading: 'Loading file…',
+        fileReadFailed: 'Failed to read file: ',
+        fileNotReadable: 'This format cannot be previewed here — use Download original.',
+        fileTruncated: (chars) => `Showing the beginning of the file (${chars} chars total); download it for the rest.`,
       },
     }
 
@@ -477,6 +485,8 @@ window.__ModuleLoader__.load({
       const [kbSearchError, setKbSearchError] = React.useState(null)
       const [fileSel, setFileSel] = React.useState(null)
       const [fileInfo, setFileInfo] = React.useState(null)
+      const [fileText, setFileText] = React.useState(null)
+      const [fileTextLoading, setFileTextLoading] = React.useState(false)
       const [fileFolderLabel, setFileFolderLabel] = React.useState('')
       const [copied, setCopied] = React.useState(false)
 
@@ -823,17 +833,34 @@ window.__ModuleLoader__.load({
       const selectFile = React.useCallback(async (item, folderLabel) => {
         setFileSel(item)
         setFileInfo(null)
+        setFileText(null)
+        setFileTextLoading(true)
         setFileFolderLabel(folderLabel || '')
         setCopied(false)
         try {
-          const payload = await getJson(API + '/kb-file?media_id=' + encodeURIComponent(item.mediaId))
+          const payload = await getJson(
+            API + '/kb-file?media_id=' + encodeURIComponent(item.mediaId) + '&title=' + encodeURIComponent(item.title || ''),
+          )
           setFileInfo({
             type: payload.type,
             typeLabel: payload.typeLabel,
+            kind: payload.kind,
+            readable: Boolean(payload.readable),
             downloadable: Boolean(payload.downloadable),
           })
         } catch {
           setFileInfo({ type: item.type, typeLabel: item.typeLabel, downloadable: false })
+        }
+        // 正文另取：md/docx 由 Host 解成文本，PDF 给它内嵌查看地址。
+        try {
+          const textPayload = await getJson(
+            API + '/kb-text?media_id=' + encodeURIComponent(item.mediaId) + '&title=' + encodeURIComponent(item.title || ''),
+          )
+          setFileText(textPayload)
+        } catch (error) {
+          setFileText({ kind: 'error', text: '', chars: 0, truncated: false, inlineUrl: '', error: String((error && error.message) || error) })
+        } finally {
+          setFileTextLoading(false)
         }
       }, [])
 
@@ -1288,42 +1315,73 @@ window.__ModuleLoader__.load({
       )
 
       // ── 右侧：知识库文件详情 / 概览 ──
+      const kbReader = fileTextLoading
+        ? h('div', { className: 'ima-kb-reader-loading' }, t.fileReading)
+        : fileText === null
+          ? null
+          : fileText.error
+            ? h('div', { className: 'ima-kb-hint ima-kb-reader-pad' }, t.fileReadFailed + fileText.error)
+            : fileText.kind === 'pdf' && fileText.inlineUrl !== ''
+              ? h('iframe', {
+                  className: 'ima-kb-fileframe',
+                  src: fileText.inlineUrl,
+                  title: fileSel === null ? 'pdf' : fileSel.title,
+                })
+              : fileText.kind === 'markdown' || fileText.kind === 'docx' || fileText.kind === 'text'
+                ? h(
+                    'div',
+                    { className: 'ima-kb-fileread' },
+                    fileText.text,
+                    fileText.truncated
+                      ? h('div', { className: 'ima-kb-hint' }, t.fileTruncated(formatNumber(fileText.chars)))
+                      : null,
+                  )
+                : h('div', { className: 'ima-kb-hint ima-kb-reader-pad' }, t.fileNotReadable)
+
       const kbMain = fileSel !== null
         ? h(
             'div',
-            { className: 'ima-kb-detail' },
-            h('div', { className: 'ima-kb-detail-title' }, fileSel.title),
-            h('div', { className: 'ima-kb-detail-meta' },
-              h('span', { className: 'ima-kb-badge' }, (fileInfo && fileInfo.typeLabel) || fileSel.typeLabel),
-              fileFolderLabel !== ''
-                ? h('span', { className: 'ima-kb-detail-row' }, t.kbInFolder + '：' + fileFolderLabel)
-                : null,
-            ),
-            h('div', { className: 'ima-kb-detail-row' },
-              t.kbFileType + '：' + ((fileInfo && fileInfo.typeLabel) || fileSel.typeLabel)),
-            h('div', { className: 'ima-kb-detail-row' },
-              t.kbFileId + '：',
-              h('code', { className: 'ima-kb-detail-id' }, fileSel.mediaId),
-              h('button', {
-                className: 'ima-kb-button ima-kb-copy',
-                type: 'button',
-                onClick: () => copyMediaId(fileSel.mediaId),
-              }, copied ? t.kbCopied : t.kbCopyId),
-            ),
-            fileInfo !== null && fileInfo.downloadable
-              ? h(
-                  'a',
+            { className: 'ima-kb-filedetail' },
+            h(
+              'div',
+              { className: 'ima-kb-filehead' },
+              h('div', { className: 'ima-kb-filetitle' }, fileSel.title),
+              h(
+                'div',
+                { className: 'ima-kb-fileheadrow' },
+                h('span', { className: 'ima-kb-badge' }, (fileInfo && fileInfo.typeLabel) || fileSel.typeLabel),
+                fileFolderLabel !== ''
+                  ? h('span', null, t.kbInFolder + '：' + fileFolderLabel)
+                  : null,
+                fileText !== null && fileText.chars > 0
+                  ? h('span', null, formatNumber(fileText.chars) + ' ' + t.charUnit)
+                  : null,
+                fileInfo !== null && fileInfo.downloadable
+                  ? h(
+                      'a',
+                      {
+                        className: 'ima-kb-button ima-kb-download',
+                        href: API + '/kb-raw?media_id=' + encodeURIComponent(fileSel.mediaId)
+                          + '&title=' + encodeURIComponent(fileSel.title),
+                        download: '',
+                      },
+                      t.kbDownload,
+                    )
+                  : fileInfo === null
+                    ? h('span', null, t.kbDownloading)
+                    : h('span', null, t.kbNoDownload),
+                h(
+                  'button',
                   {
-                    className: 'ima-kb-button ima-kb-download',
-                    href: API + '/kb-raw?media_id=' + encodeURIComponent(fileSel.mediaId)
-                      + '&title=' + encodeURIComponent(fileSel.title),
-                    download: '',
+                    className: 'ima-kb-button ima-kb-copy',
+                    type: 'button',
+                    onClick: () => copyMediaId(fileSel.mediaId),
                   },
-                  t.kbDownload,
-                )
-              : fileInfo === null
-                ? h('div', { className: 'ima-kb-hint' }, t.kbDownloading)
-                : h('div', { className: 'ima-kb-hint' }, t.kbNoDownload),
+                  copied ? t.kbCopied : t.kbCopyId,
+                ),
+              ),
+            ),
+            h('div', { className: 'ima-kb-filereadwrap' }, kbReader),
           )
         : h(
             'div',
@@ -1516,7 +1574,16 @@ window.__ModuleLoader__.load({
       '.ima-kb-detail-row{font-size:12px;color:var(--dsw-alias-label-secondary);display:flex;align-items:center;gap:8px;flex-wrap:wrap}',
       '.ima-kb-detail-id{font-size:11px;padding:3px 8px;border-radius:6px;background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary);word-break:break-all}',
       '.ima-kb-copy{height:24px;padding:0 8px;font-size:11px}',
-      '.ima-kb-download{align-self:flex-start;margin-top:6px}',
+      '.ima-kb-download{height:26px;padding:0 10px;font-size:12px}',
+      '.ima-kb-filedetail{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;background:var(--dsw-alias-bg-base)}',
+      '.ima-kb-filehead{flex:0 0 auto;display:flex;flex-direction:column;gap:8px;padding:16px 22px 12px;border-bottom:1px solid var(--dsw-alias-border-l1)}',
+      '.ima-kb-filetitle{font-size:16px;font-weight:600;line-height:1.4;word-break:break-word}',
+      '.ima-kb-fileheadrow{display:flex;align-items:center;gap:10px;flex-wrap:wrap;font-size:12px;color:var(--dsw-alias-label-secondary)}',
+      '.ima-kb-filereadwrap{flex:1 1 auto;min-height:0;display:flex;flex-direction:column}',
+      '.ima-kb-fileread{flex:1 1 auto;min-height:0;overflow:auto;padding:20px 24px;white-space:pre-wrap;word-break:break-word;font-size:13.5px;line-height:1.85;color:var(--dsw-alias-label-primary)}',
+      '.ima-kb-fileframe{flex:1 1 auto;width:100%;min-height:0;border:0;background:var(--dsw-alias-bg-layer-1)}',
+      '.ima-kb-reader-loading{flex:1 1 auto;display:flex;align-items:flex-start;justify-content:center;padding-top:28px;color:var(--dsw-alias-label-secondary);font-size:12.5px}',
+      '.ima-kb-reader-pad{margin-top:10px}',
       '.ima-kb-overview{max-width:680px;display:flex;flex-direction:column;gap:8px;text-align:left;background:var(--dsw-alias-bg-layer-1);border:1px solid var(--dsw-alias-border-l1);border-radius:12px;padding:20px 22px}',
       '.ima-kb-overview-name{font-size:16px;font-weight:600;color:var(--dsw-alias-label-primary)}',
       '.ima-kb-overview-meta{font-size:12px;color:var(--dsw-alias-label-secondary)}',

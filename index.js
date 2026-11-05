@@ -33,6 +33,7 @@ import { createHash } from 'node:crypto'
 import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import zlib from 'node:zlib'
 import { defineTool } from '@deepseek-ai/dsh-tools'
 import Schema from '@deepseek-ai/schemastery'
 
@@ -886,14 +887,24 @@ const MEDIA_TYPE_LABELS = {
 let kbListCache
 const kbDirCache = new Map()
 
+/** 文件类型徽标：优先用 ima 的 media_type，其次按扩展名猜（Markdown 版知识库就是 .md）。 */
+const KIND_LABELS = { markdown: 'Markdown', docx: 'Word', pdf: 'PDF', text: '文本', other: '文件' }
+
+function fileTypeLabel(title, mediaType) {
+  const known = MEDIA_TYPE_LABELS[mediaType]
+  if (known !== undefined) return known
+  return KIND_LABELS[inferFileKind(title, mediaType)] ?? '文件'
+}
+
 function normalizeKbItem(row) {
   if (row === null || typeof row !== 'object' || !row.media_id) return null
   const mediaType = Number(row.media_type) || 0
+  const title = typeof row.title === 'string' && row.title !== '' ? row.title : String(row.media_id)
   return {
     mediaId: String(row.media_id),
-    title: typeof row.title === 'string' && row.title !== '' ? row.title : String(row.media_id),
+    title,
     type: mediaType,
-    typeLabel: MEDIA_TYPE_LABELS[mediaType] ?? '文件',
+    typeLabel: fileTypeLabel(title, mediaType),
     folder: mediaType === 99,
     parentFolderId: typeof row.parent_folder_id === 'string' ? row.parent_folder_id : '',
     tags: Array.isArray(row.tags) ? row.tags : [],
@@ -994,6 +1005,135 @@ async function mediaInfo(mediaId) {
 function invalidateKbCaches() {
   kbListCache = undefined
   kbDirCache.clear()
+  kbTextCache.clear()
+}
+
+// ── 知识库文件阅读：把 md / docx 变成可读文本，PDF 交给浏览器内嵌查看 ──────
+const KB_TEXT_TTL_MS = 10 * 60 * 1000
+/** 单文件取回上限，避免把几百 MB 的东西拉进内存。 */
+const KB_TEXT_MAX_BYTES = 24 * 1024 * 1024
+/** 返回给面板的文本上限（阅读器只显示开头这一段，其余提示下载）。 */
+const KB_TEXT_MAX_CHARS = 600000
+const kbTextCache = new Map()
+
+/** 按扩展名判断文件类型；扩展名认不出来时退回 ima 的 media_type。 */
+function inferFileKind(title, mediaType) {
+  const lower = String(title || '').toLowerCase()
+  if (lower.endsWith('.md') || lower.endsWith('.markdown')) return 'markdown'
+  if (lower.endsWith('.docx')) return 'docx'
+  if (lower.endsWith('.pdf')) return 'pdf'
+  if (lower.endsWith('.txt')) return 'text'
+  if (mediaType === 1) return 'pdf'
+  if (mediaType === 3) return 'docx'
+  return 'other'
+}
+
+/** 解 XML 实体（docx 正文里常见）。 */
+function decodeXmlEntities(value) {
+  return value
+    .replace(/&#x([0-9a-fA-F]+);/g, (_match, hex) => String.fromCodePoint(parseInt(hex, 16)))
+    .replace(/&#(\d+);/g, (_match, dec) => String.fromCodePoint(Number(dec)))
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&apos;/g, "'")
+    .replace(/&amp;/g, '&')
+}
+
+/**
+ * 从 zip 里读出一个条目（docx 本质是 zip）。
+ * 只支持标准本地文件头 + store/deflate 两种压缩方式，够读 docx。
+ * @returns {Buffer|undefined} 解压后的内容
+ */
+function readZipEntry(buffer, wantedName) {
+  const { inflateRawSync } = zlib
+  let offset = 0
+  while (offset + 30 <= buffer.length) {
+    if (buffer.readUInt32LE(offset) !== 0x04034b50) return undefined
+    const method = buffer.readUInt16LE(offset + 8)
+    const compressedSize = buffer.readUInt32LE(offset + 18)
+    const nameLength = buffer.readUInt16LE(offset + 26)
+    const extraLength = buffer.readUInt16LE(offset + 28)
+    const nameStart = offset + 30
+    const name = buffer.toString('utf8', nameStart, nameStart + nameLength)
+    const dataStart = nameStart + nameLength + extraLength
+    const dataEnd = dataStart + compressedSize
+    if (dataEnd > buffer.length) return undefined
+    if (name === wantedName) {
+      const data = buffer.subarray(dataStart, dataEnd)
+      if (method === 0) return data
+      if (method === 8) return inflateRawSync(data)
+      return undefined
+    }
+    offset = dataEnd
+  }
+  return undefined
+}
+
+/** docx → 纯文本：段落换行、制表符保留，图片与样式丢弃。 */
+function extractDocxText(buffer) {
+  const xml = readZipEntry(buffer, 'word/document.xml')
+  if (xml === undefined) return ''
+  return decodeXmlEntities(
+    xml
+      .toString('utf8')
+      .replace(/<w:tab[^>]*\/>/g, '\t')
+      .replace(/<w:br[^>]*\/>/g, '\n')
+      .replace(/<\/w:p>/g, '\n')
+      .replace(/<[^>]+>/g, ''),
+  )
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/**
+ * 取一个知识库文件的正文，供面板阅读器显示。
+ * @returns {{kind: string, text: string, chars: number, truncated: boolean, inlineUrl: string}}
+ */
+async function kbFileText(mediaId, title) {
+  const cached = kbTextCache.get(mediaId)
+  if (cached !== undefined && Date.now() - cached.at < KB_TEXT_TTL_MS) return cached.value
+  const info = await mediaInfo(mediaId)
+  const kind = inferFileKind(title, info.mediaType)
+  if (kind === 'pdf') {
+    // PDF 不在这里解，浏览器自带查看器更靠谱：交给 inline 代理地址用 iframe 显示。
+    const value = { kind, text: '', chars: 0, truncated: false, inlineUrl: `/ima-kb/api/kb-raw?media_id=${encodeURIComponent(mediaId)}&inline=1` }
+    kbTextCache.set(mediaId, { at: Date.now(), value })
+    return value
+  }
+  if (kind === 'other') {
+    const value = { kind, text: '', chars: 0, truncated: false, inlineUrl: '' }
+    kbTextCache.set(mediaId, { at: Date.now(), value })
+    return value
+  }
+  if (info.url === '') throw new Error('这个文件没有可下载的原文')
+  let response
+  try {
+    response = await fetch(info.url, { headers: info.headers, signal: AbortSignal.timeout(60000) })
+  } catch (error) {
+    throw new Error(`取文件失败：${error instanceof Error ? error.message : String(error)}`)
+  }
+  if (!response.ok) throw new Error(`取文件失败：HTTP ${response.status}`)
+  const arrayBuffer = await response.arrayBuffer()
+  if (arrayBuffer.byteLength > KB_TEXT_MAX_BYTES) {
+    throw new Error(`文件太大（${Math.round(arrayBuffer.byteLength / 1048576)} MB），请点「下载原文」`)
+  }
+  const buffer = Buffer.from(arrayBuffer)
+  let text = kind === 'docx' ? extractDocxText(buffer) : buffer.toString('utf8')
+  if (kind === 'markdown') {
+    // Markdown 里的图片在面板里显示不了，换成占位符，避免一串 ![](...) 干扰阅读。
+    text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, (_match, alt) => (alt ? `［图片：${alt}］` : '［图片］'))
+  }
+  const truncated = text.length > KB_TEXT_MAX_CHARS
+  const value = {
+    kind,
+    text: truncated ? text.slice(0, KB_TEXT_MAX_CHARS) : text,
+    chars: text.length,
+    truncated,
+    inlineUrl: '',
+  }
+  kbTextCache.set(mediaId, { at: Date.now(), value })
+  return value
 }
 
 // ── 笔记官方检索（分词召回，弥补本地字面检索「换一种说法就搜不到」） ──
@@ -1527,21 +1667,47 @@ function registerRoutes(ctx) {
       }
       if (route === 'kb-file') {
         const mediaId = url.searchParams.get('media_id') ?? ''
+        const title = url.searchParams.get('title') ?? ''
         if (mediaId === '') {
           sendJson(res, 400, { error: 'missing media_id' })
           return
         }
         const info = await mediaInfo(mediaId)
+        const kind = inferFileKind(title, info.mediaType)
         sendJson(res, 200, {
           mediaId,
           type: info.mediaType,
-          typeLabel: MEDIA_TYPE_LABELS[info.mediaType] ?? '文件',
+          typeLabel: fileTypeLabel(title, info.mediaType),
+          kind,
+          readable: kind === 'markdown' || kind === 'docx' || kind === 'pdf' || kind === 'text',
           downloadable: info.url !== '',
         })
         return
       }
+      if (route === 'kb-text') {
+        const mediaId = url.searchParams.get('media_id') ?? ''
+        const title = url.searchParams.get('title') ?? ''
+        if (mediaId === '') {
+          sendJson(res, 400, { error: 'missing media_id' })
+          return
+        }
+        try {
+          sendJson(res, 200, await kbFileText(mediaId, title))
+        } catch (error) {
+          sendJson(res, 200, {
+            kind: 'error',
+            text: '',
+            chars: 0,
+            truncated: false,
+            inlineUrl: '',
+            error: error instanceof Error ? error.message : String(error),
+          })
+        }
+        return
+      }
       if (route === 'kb-raw') {
         const mediaId = url.searchParams.get('media_id') ?? ''
+        const inline = url.searchParams.get('inline') === '1'
         if (mediaId === '') {
           sendJson(res, 400, { error: 'missing media_id' })
           return
@@ -1559,11 +1725,10 @@ function registerRoutes(ctx) {
           }
           const title = url.searchParams.get('title') ?? 'file'
           const contentType = upstream.headers.get('content-type') ?? 'application/octet-stream'
-          res.writeHead(200, {
-            'content-type': contentType,
-            'content-disposition': `attachment; filename*=UTF-8''${encodeURIComponent(title)}`,
-            'cache-control': 'no-store',
-          })
+          const headers = { 'content-type': contentType, 'cache-control': 'no-store' }
+          // inline=1 用于面板里 iframe 直接看 PDF；否则按下载处理。
+          if (!inline) headers['content-disposition'] = `attachment; filename*=UTF-8''${encodeURIComponent(title)}`
+          res.writeHead(200, headers)
           for await (const chunk of upstream.body) {
             res.write(chunk)
           }

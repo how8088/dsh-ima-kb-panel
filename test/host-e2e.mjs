@@ -71,10 +71,14 @@ function makeCaller(route) {
     new Promise((resolve, reject) => {
       const req = { url: path, method: opts.method ?? 'GET', headers: opts.headers ?? browserHeaders }
       let status = 200
+      let headers = {}
       const chunks = []
       let destroyed = false
       const res = {
-        writeHead: (code) => { status = code },
+        writeHead: (code, responseHeaders) => {
+          status = code
+          if (responseHeaders !== undefined && responseHeaders !== null) headers = responseHeaders
+        },
         write: (chunk) => {
           if (!destroyed) chunks.push(Buffer.from(chunk))
           return true
@@ -84,11 +88,11 @@ function makeCaller(route) {
           const buf = body !== undefined ? Buffer.concat([...chunks, Buffer.from(body)]) : Buffer.concat(chunks)
           let parsed = buf
           try { parsed = JSON.parse(buf.toString('utf8')) } catch { /* 二进制 */ }
-          resolve({ status, body: parsed, bytes: buf.length })
+          resolve({ status, headers, body: parsed, bytes: buf.length })
         },
         destroy: () => {
           destroyed = true
-          resolve({ status, body: {}, bytes: Buffer.concat(chunks).length })
+          resolve({ status, headers, body: {}, bytes: Buffer.concat(chunks).length })
         },
       }
       Promise.resolve(route.handler(req, res)).catch(reject)
@@ -236,12 +240,27 @@ if (rootFolder) {
   check('子目录带面包屑', Array.isArray(sub.body.path) && sub.body.path.length >= 2, JSON.stringify(sub.body.path).slice(0, 160))
   const file = ((sub.body && sub.body.items) || []).find((x) => !x.folder)
   if (file) {
-    const info = await call(`/ima-kb/api/kb-file?media_id=${encodeURIComponent(file.mediaId)}`)
-    check('/kb-file 可下载', info.status === 200 && info.body.downloadable === true, JSON.stringify(info.body))
+    const info = await call(`/ima-kb/api/kb-file?media_id=${encodeURIComponent(file.mediaId)}&title=${encodeURIComponent(file.title)}`)
+    check('/kb-file 可下载', info.status === 200 && info.body.downloadable === true, JSON.stringify(info.body).slice(0, 160))
+    check('/kb-file 给出 kind/typeLabel', typeof info.body.kind === 'string' && typeof info.body.typeLabel === 'string', JSON.stringify(info.body).slice(0, 160))
     const raw = await call(`/ima-kb/api/kb-raw?media_id=${encodeURIComponent(file.mediaId)}&title=test.bin`)
     check('/kb-raw 代理返回字节', raw.status === 200 && raw.bytes > 0, `status=${raw.status} bytes=${raw.bytes}`)
+    check('/kb-raw 下载带 Content-Disposition', String(raw.headers['content-disposition'] || '').startsWith('attachment'), String(raw.headers['content-disposition']))
+    const inline = await call(`/ima-kb/api/kb-raw?media_id=${encodeURIComponent(file.mediaId)}&inline=1`)
+    check('/kb-raw inline 不带 Content-Disposition', inline.status === 200 && inline.bytes > 0 && inline.headers['content-disposition'] === undefined, `status=${inline.status} cd=${String(inline.headers['content-disposition'])}`)
+    // 阅读器接口：md/docx/text 要回正文，pdf 要回内嵌地址
+    const text = await call(`/ima-kb/api/kb-text?media_id=${encodeURIComponent(file.mediaId)}&title=${encodeURIComponent(file.title)}`)
+    check('/kb-text 200 且带 kind', text.status === 200 && typeof text.body.kind === 'string', JSON.stringify(text.body).slice(0, 160))
+    const kind = text.body.kind
+    if (kind === 'pdf') {
+      check('/kb-text PDF 给内嵌地址', String(text.body.inlineUrl || '').includes('inline=1'), String(text.body.inlineUrl))
+    } else if (kind === 'markdown' || kind === 'docx' || kind === 'text') {
+      check('/kb-text 文本类返回正文', String(text.body.text || '').length > 20 && text.body.chars > 0, `kind=${kind} chars=${text.body.chars}`)
+    } else {
+      console.log(`  (文件 kind=${kind}，跳过正文检查)`)
+    }
   } else {
-    console.log('  (子目录没有文件，跳过 kb-raw 检查)')
+    console.log('  (子目录没有文件，跳过 kb-raw / kb-text 检查)')
   }
 } else {
   console.log('  (根目录没有文件夹，跳过子目录检查)')
