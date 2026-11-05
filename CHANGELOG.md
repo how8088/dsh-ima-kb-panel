@@ -1,5 +1,13 @@
 # Changelog
 
+## 2.3.1 — 2026-11-05
+
+- **技能里的知识库表按实测更新**：账号现在只剩 **3 个**知识库（Markdown 版 / 宏观研报精选 / 深证信），
+  研万里 A股调研纪要、法律案例库、浑水调研 三个订阅库已不在，旧 Word 版知识库也已删除。
+- **发版 workflow 只在 tag 上建 Release**：`workflow_dispatch` 手动触发时 `GITHUB_REF_NAME` 是
+  分支名，以前会建出一个叫 `main` 的 Release。现在 `gh release create` 加了 `refs/tags/` 判断，
+  手动触发只打包、不发版。
+
 ## 2.3.0 — 2026-11-05
 
 **部署**：换一台桌面版机器装完 tgz 就能用，不用再手工打补丁。
