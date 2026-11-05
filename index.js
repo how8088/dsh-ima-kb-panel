@@ -649,6 +649,12 @@ function warmAll() {
         }
       }
       if (recovered > 0) warmState.failed = Math.max(0, warmState.failed - recovered)
+      // 顺手清掉「已经不在列表里」的笔记缓存（用户删了笔记 / 重建换了 id），
+      // 否则磁盘缓存会一直带着这些孤儿条目。
+      const liveIds = new Set(notes.map((note) => note.id))
+      for (const noteId of Array.from(contentCache.keys())) {
+        if (!liveIds.has(noteId)) contentCache.delete(noteId)
+      }
     } finally {
       saveSuppressed -= 1
       warmState.running = false
@@ -1179,6 +1185,35 @@ async function findNotes(query, options) {
   }
 }
 
+/**
+ * 笔记 ↔ 知识库文件互跳：拿笔记标题去「我自己的」知识库里按文件名检索。
+ * 笔记和知识库文档是同一批材料的两份入口，标题基本一致，所以按标题就能对上。
+ * @returns {{kbId: string, kbName: string, item: object}|null}
+ */
+async function findKbFileForTitle(title) {
+  const wanted = String(title ?? '').trim()
+  if (wanted === '') return null
+  const kbs = await listKnowledgeBases()
+  if (kbs.length === 0) return null
+  const mine = kbs.filter((kb) => kb.role.includes('创建') || kb.role.toLowerCase().includes('owner'))
+  const targets = mine.length > 0 ? mine : kbs.slice(0, 2)
+  const query = wanted.replace(/\s+/g, ' ').slice(0, 60)
+  for (const kb of targets) {
+    try {
+      const items = await searchKbFiles(kb.id, query)
+      if (items.length === 0) continue
+      const clean = (value) => String(value || '').replace(/\.(md|markdown|docx|pdf|txt)$/i, '').replace(/\s+/g, '').trim()
+      const best = items.find((item) => !item.folder && clean(item.title) === clean(wanted))
+        ?? items.find((item) => !item.folder)
+        ?? items[0]
+      return { kbId: kb.id, kbName: kb.name, item: best }
+    } catch {
+      // 这个知识库查不了就换下一个。
+    }
+  }
+  return null
+}
+
 // ── 工具 ────────────────────────────────────────────────────────────────
 const TEXT_OUTPUT = {
   schema: { type: 'string' },
@@ -1215,6 +1250,9 @@ function registerTools(ctx) {
       const shown = want === '' ? notes : notes.filter((note) => note.title.toLowerCase().includes(want.toLowerCase()))
       if (shown.length === 0) return `没有标题含「${want}」的笔记。`
       const truncated = notesCache !== undefined && notesCache.truncated === true
+      // 全量列表压成「一行一篇」：70 篇的旧格式要 200 多行、白占上下文；
+      // 只有按关键词过滤（结果变少）时才附带开头预览。
+      const verbose = want !== '' || shown.length <= 12
       const lines = [
         `共 ${shown.length} 篇笔记${want !== '' ? `（标题含「${want}」；全库 ${notes.length} 篇）` : ''}${truncated ? `（已达到 maxNotes=${settings.maxNotes} 上限，可能还有更多）` : ''}：`,
         '',
@@ -1222,11 +1260,10 @@ function registerTools(ctx) {
       for (const note of shown) {
         const chars = cachedChars(note.id)
         const size = chars === null ? '' : ` · ${formatCount(chars)} 字`
-        lines.push(`- ${note.title}${size}`)
-        lines.push(`  note_id: ${note.id}`)
-        if (note.preview !== '') lines.push(`  开头：${note.preview}`)
+        lines.push(`- ${note.title}${size} · id=${note.id}`)
+        if (verbose && note.preview !== '') lines.push(`  开头：${note.preview}`)
       }
-      lines.push('', '用 kb_search 在全部笔记里检索，用 kb_read 按偏移量读取正文。')
+      lines.push('', '用 kb_find / kb_search 检索，用 kb_read(note_id, offset) 读正文。')
       return lines.join('\n')
     },
   })
@@ -1649,6 +1686,20 @@ function registerRoutes(ctx) {
           url.searchParams.get('cursor') ?? '',
         )
         sendJson(res, 200, dir)
+        return
+      }
+      if (route === 'kb-link') {
+        const title = (url.searchParams.get('title') ?? '').trim()
+        if (title === '') {
+          sendJson(res, 200, { found: false })
+          return
+        }
+        const match = await findKbFileForTitle(title)
+        if (match === null) {
+          sendJson(res, 200, { found: false })
+          return
+        }
+        sendJson(res, 200, { found: true, kbId: match.kbId, kbName: match.kbName, item: match.item })
         return
       }
       if (route === 'kb-search') {

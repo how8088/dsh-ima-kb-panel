@@ -99,6 +99,12 @@ window.__ModuleLoader__.load({
         fileReadFailed: '读取失败：',
         fileNotReadable: '这种格式面板里看不了，点「下载原文」用本地软件打开。',
         fileTruncated: (chars) => `正文较长，这里只显示开头部分（共 ${chars} 字）；完整内容请点「下载原文」。`,
+        toc: '目录',
+        tocEmpty: '这篇没有二级标题',
+        openInKb: '知识库原文',
+        openNoteOfFile: '打开对应笔记',
+        kbLinkNoFile: '知识库里没找到同标题的文件',
+        linkNoNote: '笔记里没有同标题的一篇',
       },
       en: {
         title: 'ima Knowledge Base',
@@ -166,6 +172,12 @@ window.__ModuleLoader__.load({
         fileReadFailed: 'Failed to read file: ',
         fileNotReadable: 'This format cannot be previewed here — use Download original.',
         fileTruncated: (chars) => `Showing the beginning of the file (${chars} chars total); download it for the rest.`,
+        toc: 'Contents',
+        tocEmpty: 'No section headings',
+        openInKb: 'KB original',
+        openNoteOfFile: 'Open note',
+        kbLinkNoFile: 'No file with the same title in the knowledge base',
+        linkNoNote: 'No note with the same title',
       },
     }
 
@@ -457,6 +469,10 @@ window.__ModuleLoader__.load({
       const [doc, setDoc] = React.useState(null)
       const [docError, setDocError] = React.useState(null)
       const [loadingDoc, setLoadingDoc] = React.useState(false)
+      /** 阅读器：本篇章节目录开关、跨笔记的滚动位置记忆、笔记→知识库文件跳转状态。 */
+      const [tocOpen, setTocOpen] = React.useState(false)
+      const scrollMemoRef = React.useRef({})
+      const [linkError, setLinkError] = React.useState(null)
       const [query, setQuery] = React.useState('')
       const [results, setResults] = React.useState(null)
       const [searching, setSearching] = React.useState(false)
@@ -591,22 +607,24 @@ window.__ModuleLoader__.load({
       }, [warming, searching])
 
       const openNote = React.useCallback(async (noteId, start, anchor) => {
+        const from = Math.max(0, start)
         setSelected(noteId)
         setDocError(null)
+        setTocOpen(false)
         setLoadingDoc(true)
         try {
           const payload = await getJson(
-            API + '/note?id=' + encodeURIComponent(noteId) + '&start=' + Math.max(0, start) + '&length=' + WINDOW_CHARS,
+            API + '/note?id=' + encodeURIComponent(noteId) + '&start=' + from + '&length=' + WINDOW_CHARS,
           )
           setDoc({
             id: payload.id,
             title: payload.title,
             chars: payload.chars,
             content: payload.content,
+            start: from,
             end: payload.end,
             anchor: typeof anchor === 'number' ? anchor : null,
           })
-          if (readerRef.current) readerRef.current.scrollTop = 0
         } catch (error) {
           setDoc(null)
           setDocError(describeError(error, t))
@@ -628,6 +646,7 @@ window.__ModuleLoader__.load({
             title: current.title,
             chars: current.chars,
             content: current.content + payload.content,
+            start: current.start,
             end: payload.end,
             anchor: current.anchor,
           })
@@ -727,10 +746,62 @@ window.__ModuleLoader__.load({
       const onReaderScroll = React.useCallback(
         (event) => {
           const node = event.currentTarget
+          const current = docRef.current
+          if (current !== null) scrollMemoRef.current[current.id] = node.scrollTop
           if (node.scrollHeight - node.scrollTop - node.clientHeight < 320) loadMore()
         },
         [loadMore],
       )
+
+      /**
+       * 打开 / 续读一篇笔记后恢复滚动位置：
+       *  - 搜索点进来的（带 anchor）：按「命中字符在窗口里的比例」估算位置，直接落到位；
+       *  - 之前读过这篇：回到上次的位置；
+       *  - 其余从头开始。
+       * 依赖只用 id/start/anchor，避免「加载更多」追加内容时把滚动位置重置。
+       */
+      React.useEffect(() => {
+        if (doc === null) return undefined
+        const node = readerRef.current
+        if (node === null) return undefined
+        const frame = requestAnimationFrame(() => {
+          const saved = scrollMemoRef.current[doc.id]
+          if (typeof saved === 'number') {
+            node.scrollTop = saved
+            return
+          }
+          if (typeof doc.anchor === 'number' && doc.content.length > 0) {
+            const offsetInWindow = Math.max(0, doc.anchor - (doc.start || 0))
+            const ratio = Math.min(1, offsetInWindow / doc.content.length)
+            node.scrollTop = Math.max(0, ratio * (node.scrollHeight - node.clientHeight) - 140)
+            return
+          }
+          node.scrollTop = 0
+        })
+        return () => cancelAnimationFrame(frame)
+      }, [doc === null ? null : doc.id, doc === null ? null : doc.start, doc === null ? null : doc.anchor])
+
+      /** 本篇章节目录：正文里的二级标题。 */
+      const tocItems = React.useMemo(() => {
+        if (doc === null) return []
+        const items = []
+        const pattern = /^## +(.+)$/gm
+        let match = pattern.exec(doc.content)
+        while (match !== null && items.length < 300) {
+          items.push({ title: match[1].trim(), index: match.index })
+          match = pattern.exec(doc.content)
+        }
+        return items
+      }, [doc])
+
+      const jumpToTocItem = React.useCallback((item) => {
+        const node = readerRef.current
+        const current = docRef.current
+        if (node === null || current === null) return
+        const ratio = Math.min(1, item.index / Math.max(1, current.content.length))
+        node.scrollTop = Math.max(0, ratio * (node.scrollHeight - node.clientHeight))
+        setTocOpen(false)
+      }, [])
 
       const onRefresh = React.useCallback(async () => {
         setResults(null)
@@ -863,6 +934,52 @@ window.__ModuleLoader__.load({
           setFileTextLoading(false)
         }
       }, [])
+
+      /** 笔记 → 知识库原文：同标题在「我的知识库」里找对应文件并切过去。 */
+      const openKbForDoc = React.useCallback(async () => {
+        const current = docRef.current
+        if (current === null) return
+        setLinkError(null)
+        try {
+          const payload = await getJson(API + '/kb-link?title=' + encodeURIComponent(current.title))
+          if (!payload || payload.found !== true || !payload.item) {
+            setLinkError(t.kbLinkNoFile)
+            setTimeout(() => setLinkError(null), 4000)
+            return
+          }
+          setTab('kb')
+          writeLocal(TAB_KEY, 'kb')
+          setSelectedKb(payload.kbId)
+          writeLocal(KB_KEY, payload.kbId)
+          setKbResults(null)
+          setKbQ('')
+          setFileFolderLabel('')
+          loadDir(payload.kbId, payload.item.parentFolderId || '', '', false)
+          selectFile(payload.item, '')
+        } catch (error) {
+          setLinkError(describeError(error, t))
+          setTimeout(() => setLinkError(null), 4000)
+        }
+      }, [loadDir, selectFile])
+
+      /** 知识库文件 → 对应笔记：标题归一化后在笔记列表里找。 */
+      const openNoteForFile = React.useCallback(() => {
+        if (fileSel === null) return
+        const clean = (value) => String(value || '')
+          .replace(/\.(md|markdown|docx|pdf|txt)$/i, '')
+          .replace(/\s+/g, '')
+          .trim()
+        const target = clean(fileSel.title)
+        const found = (notes || []).find((note) => clean(note.title) === target)
+        if (found === undefined) {
+          setLinkError(t.linkNoNote)
+          setTimeout(() => setLinkError(null), 4000)
+          return
+        }
+        setTab('notes')
+        writeLocal(TAB_KEY, 'notes')
+        openNote(found.id, 0, null)
+      }, [fileSel, notes, openNote])
 
       React.useEffect(() => {
         if (tab !== 'kb' || kbs !== null) return
@@ -1379,7 +1496,9 @@ window.__ModuleLoader__.load({
                   },
                   copied ? t.kbCopied : t.kbCopyId,
                 ),
+                h('button', { className: 'ima-kb-button', type: 'button', onClick: openNoteForFile }, t.openNoteOfFile),
               ),
+              linkError !== null ? h('div', { className: 'ima-kb-hint' }, linkError) : null,
             ),
             h('div', { className: 'ima-kb-filereadwrap' }, kbReader),
           )
@@ -1489,6 +1608,19 @@ window.__ModuleLoader__.load({
                         { className: 'ima-kb-docmeta' },
                         formatNumber(doc.chars) + ' ' + t.charUnit + ' · 0–' + formatNumber(doc.end),
                       ),
+                      tocItems.length > 0
+                        ? h(
+                            'button',
+                            {
+                              className: 'ima-kb-button',
+                              type: 'button',
+                              'data-active': tocOpen ? 'true' : 'false',
+                              onClick: () => setTocOpen((value) => !value),
+                            },
+                            t.toc,
+                          )
+                        : null,
+                      h('button', { className: 'ima-kb-button', type: 'button', onClick: openKbForDoc }, t.openInKb),
                       doc.end < doc.chars
                         ? h(
                             'button',
@@ -1500,10 +1632,31 @@ window.__ModuleLoader__.load({
                         ? h('button', { className: 'ima-kb-button', type: 'button', onClick: backToStart }, t.backToStart)
                         : null,
                     ),
+                    linkError !== null ? h('div', { className: 'ima-kb-hint' }, linkError) : null,
+                    tocOpen && tocItems.length > 0
+                      ? h(
+                          'div',
+                          { className: 'ima-kb-toc' },
+                          tocItems.map((item, index) =>
+                            h(
+                              'button',
+                              {
+                                key: 'toc-' + index,
+                                type: 'button',
+                                className: 'ima-kb-toc-item',
+                                onClick: () => jumpToTocItem(item),
+                              },
+                              item.title,
+                            ),
+                          ),
+                        )
+                      : tocOpen
+                        ? h('div', { className: 'ima-kb-hint' }, t.tocEmpty)
+                        : null,
                     h(
                       'div',
                       { className: 'ima-kb-reader', onScroll: onReaderScroll, ref: readerRef },
-                      highlight(doc.content, terms),
+                      h('div', { className: 'ima-kb-reader-inner' }, highlight(doc.content, terms)),
                       loadingDoc ? h('div', { className: 'ima-kb-hint' }, t.counting) : null,
                     ),
                   ),
@@ -1565,6 +1718,11 @@ window.__ModuleLoader__.load({
       '.ima-kb-doctitle{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1 1 auto;min-width:0}',
       '.ima-kb-docmeta{font-size:11px;color:var(--dsw-alias-label-secondary);flex:0 0 auto}',
       '.ima-kb-reader{flex:1 1 auto;min-height:0;overflow:auto;padding:16px 20px;white-space:pre-wrap;word-break:break-word;font-size:13px;line-height:1.78}',
+      '.ima-kb-reader-inner{max-width:860px;margin:0 auto}',
+      '.ima-kb-toc{flex:0 0 auto;max-height:38%;overflow:auto;border-bottom:1px solid var(--dsw-alias-border-l1);background:var(--dsw-alias-bg-layer-1);padding:6px 10px}',
+      '.ima-kb-toc-item{display:block;width:100%;text-align:left;font:inherit;font-size:12px;line-height:1.5;color:var(--dsw-alias-label-secondary);background:none;border:none;border-radius:6px;padding:5px 8px;cursor:pointer}',
+      '.ima-kb-toc-item:hover{background:var(--dsw-alias-bg-layer-2);color:var(--dsw-alias-label-primary)}',
+      '.ima-kb-button[data-active="true"]{border-color:var(--dsw-alias-brand-primary);color:var(--dsw-alias-brand-primary)}',
       '.ima-kb-empty{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12.5px;padding:24px;text-align:center}',
       '.ima-kb-hint{color:var(--dsw-alias-label-secondary);font-size:12px;padding:6px 10px;line-height:1.6;word-break:break-word}',
       '.ima-kb-mark{background:transparent;color:var(--dsw-alias-brand-primary);font-weight:600;border-bottom:2px solid var(--dsw-alias-brand-primary)}',

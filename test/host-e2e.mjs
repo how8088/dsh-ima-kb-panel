@@ -206,6 +206,8 @@ const kbList = boot1.tools.find((t) => t.name === 'kb_list')
 const listText = await kbList.execute({}, {})
 check('kb_list 覆盖全部笔记', listText.includes(`共 ${rows.length} 篇笔记`), listText.slice(0, 80))
 check('kb_list 带字数', /\d+ 字/.test(listText), listText.slice(0, 200))
+// v1.7.0：全量列表压成「一行一篇」，不再每篇多吐 note_id / 开头预览两行。
+check('kb_list 压成一行一篇', listText.includes('id=') && !listText.includes('\n  开头：'), listText.slice(0, 140))
 const kbSearch = boot1.tools.find((t) => t.name === 'kb_search')
 const searchText = await kbSearch.execute({ query: term, limit: 3 }, {})
 check('kb_search 返回命中段落', searchText.includes('命中') && searchText.includes('offset '), searchText.slice(0, 120))
@@ -268,6 +270,19 @@ if (rootFolder) {
 
 const kbSearchRes = await call(`/ima-kb/api/kb-search?kb=${encodeURIComponent(primary.id)}&q=${encodeURIComponent('复盘')}`)
 check('/kb-search 200', kbSearchRes.status === 200 && Array.isArray((kbSearchRes.body || {}).items), String(kbSearchRes.status))
+
+// v1.7.0：笔记 ↔ 知识库文件互跳（按标题在「我的知识库」里找同名文件）
+const linkTargetNote = rows.find((row) => /学员总结|课程原文/.test(row.title)) || rows[0]
+const linkRes = await call('/ima-kb/api/kb-link?title=' + encodeURIComponent(linkTargetNote.title))
+check('/kb-link 200', linkRes.status === 200 && typeof linkRes.body.found === 'boolean', JSON.stringify(linkRes.body).slice(0, 120))
+if (linkRes.body.found) {
+  check('/kb-link 找到同名文件', typeof linkRes.body.item.mediaId === 'string' && linkRes.body.item.folder === false, JSON.stringify(linkRes.body.item).slice(0, 160))
+  check('/kb-link 带 kbId', typeof linkRes.body.kbId === 'string' && linkRes.body.kbId !== '', String(linkRes.body.kbId))
+} else {
+  console.log(`  (/kb-link 未找到「${linkTargetNote.title}」对应文件，跳过字段检查)`)
+}
+const linkEmpty = await call('/ima-kb/api/kb-link?title=')
+check('/kb-link 空标题返回未找到', linkEmpty.status === 200 && linkEmpty.body.found === false, JSON.stringify(linkEmpty.body).slice(0, 80))
 
 const kbSpaceList = boot1.tools.find((t) => t.name === 'kb_space_list')
 const spaceText = await kbSpaceList.execute({}, {})
