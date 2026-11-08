@@ -125,10 +125,10 @@ export const Config = Schema.object({
     .description("是否在启动/检索时自动把全部笔记正文拉到本地；默认 off，只有手动点「缓存全部正文」才取。填 on 恢复后台自动预热"),
   kbCacheTtlMinutes: Schema.number()
     .step(1)
-    .min(1)
+    .min(0)
     .max(525600)
-    .default(10080)
-    .description('个人知识库本地缓存保留多久（分钟）。只对「我的知识库」生效，订阅/加入的库不写磁盘'),
+    .default(0)
+    .description('个人知识库本地缓存过期时间（分钟）。**默认 0 = 永不过期**，要不要更新完全由人决定；填大于 0 才会自动过期'),
   kbCacheText: Schema.string()
     .default('on')
     .description("预热个人知识库时是否连正文一起缓存（md/docx/txt）；填 off 只缓存目录，正文仍按需在线取"),
@@ -229,7 +229,7 @@ const settings = {
   skillsDir: '',
   autoInstallSkills: 'on',
   autoWarm: 'off',
-  kbCacheTtlMs: 10080 * 60 * 1000,
+  kbCacheTtlMs: 0,
   kbCacheText: 'on',
   kbCacheMaxFiles: 2000,
   kbCacheMaxMb: 512,
@@ -264,7 +264,7 @@ function resolveSettings(raw) {
   settings.skillsDir = nonEmptyString(config.skillsDir)
   settings.autoInstallSkills = config.autoInstallSkills === 'off' ? 'off' : 'on'
   settings.autoWarm = config.autoWarm === 'on' ? 'on' : 'off'
-  settings.kbCacheTtlMs = clamp(config.kbCacheTtlMinutes ?? 10080, 1, 525600) * 60 * 1000
+  settings.kbCacheTtlMs = clamp(config.kbCacheTtlMinutes ?? 0, 0, 525600) * 60 * 1000
   settings.kbCacheText = config.kbCacheText === 'off' ? 'off' : 'on'
   settings.kbCacheMaxFiles = clamp(config.kbCacheMaxFiles ?? 2000, 1, 50000)
   settings.kbCacheMaxMb = clamp(config.kbCacheMaxMb ?? 512, 1, 102400)
@@ -1363,14 +1363,8 @@ function normalizeKbItem(row) {
 }
 
 /** 列出当前凭证能看到的全部知识库（自动翻页）。 */
-async function listKnowledgeBases() {
-  if (kbListCache !== undefined && Date.now() - kbListCache.at < KB_LIST_TTL_MS) return kbListCache.items
-  const fromDisk = diskKbList()
-  if (fromDisk !== undefined) {
-    const entry = kbDisk.list
-    kbListCache = { at: Number(entry.at) || Date.now(), items: fromDisk }
-    return fromDisk
-  }
+/** 从 ima 拉一遍知识库列表（自动翻页）。 */
+async function fetchKbList() {
   const items = []
   let cursor = ''
   for (let page = 0; page < MAX_KB_PAGES; page += 1) {
@@ -1395,9 +1389,33 @@ async function listKnowledgeBases() {
     cursor = typeof data?.next_cursor === 'string' ? data.next_cursor : ''
     if (cursor === '') break
   }
-  kbListCache = { at: Date.now(), items }
-  saveKbList(items)
   return items
+}
+
+/**
+ * 知识库列表只有元数据（几条到几十条），1 小时内直接用内存里的；更旧就尝试联网刷新一次，
+ * 联网失败再退回本地那份——这样断网也能打开面板，又不会因为「快照永不过期」而永远看不到新建的库。
+ * 注意：这里只管列表，**内容快照**（目录/正文/PDF）不会自动过期。
+ */
+async function listKnowledgeBases() {
+  if (kbListCache !== undefined && Date.now() - kbListCache.at < KB_LIST_TTL_MS) return kbListCache.items
+  const local = diskKbList()
+  if (local !== undefined && Date.now() - local.at < KB_LIST_TTL_MS * 12) {
+    kbListCache = { at: local.at, items: local.items }
+    return local.items
+  }
+  try {
+    const items = await fetchKbList()
+    kbListCache = { at: Date.now(), items }
+    saveKbList(items)
+    return items
+  } catch (error) {
+    if (local !== undefined) {
+      kbListCache = { at: Date.now(), items: local.items }
+      return local.items
+    }
+    throw error
+  }
 }
 
 /** 这个 kb_id 是不是个人知识库（列表没缓存时先拉一次列表）。 */
@@ -1923,10 +1941,13 @@ function ensureKbDiskLoaded() {
   if (payload.snaps !== null && typeof payload.snaps === 'object') kbDisk.snaps = payload.snaps
 }
 
+/** 缓存条目是否还有效。kbCacheTtlMinutes = 0（默认）表示**永不过期**，什么时候更新由人来决定。 */
 function kbFresh(entry) {
   if (entry === null || typeof entry !== 'object') return false
   const at = Number(entry.at) || 0
-  return at > 0 && Date.now() - at < settings.kbCacheTtlMs
+  if (at <= 0) return false
+  if (settings.kbCacheTtlMs <= 0) return true
+  return Date.now() - at < settings.kbCacheTtlMs
 }
 
 function writeKbDisk() {
@@ -2010,11 +2031,13 @@ function saveKbList(items) {
   scheduleKbSave()
 }
 
+/** 本地那份知识库列表（不判过期，由调用方决定用不用）。 */
 function diskKbList() {
   ensureKbDiskLoaded()
   const entry = kbDisk === null ? undefined : kbDisk.list
-  if (!kbFresh(entry)) return undefined
-  return Array.isArray(entry.items) ? entry.items : undefined
+  if (entry === null || typeof entry !== 'object') return undefined
+  if (!Array.isArray(entry.items) || entry.items.length === 0) return undefined
+  return { at: Number(entry.at) || 0, items: entry.items }
 }
 
 function kbDirKeyOf(folderId, cursor) {
