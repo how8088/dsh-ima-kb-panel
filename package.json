@@ -1,6 +1,6 @@
 {
   "name": "dsh-ima-kb-panel",
-  "version": "2.7.1",
+  "version": "2.7.2",
   "private": true,
   "type": "module",
   "description": "ima 知识库侧边栏面板与对话读取工具（DeepSeek Harness 插件）",

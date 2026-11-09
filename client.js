@@ -301,7 +301,12 @@ window.__ModuleLoader__.load({
         .slice(0, 6)
     }
 
-    function highlight(textValue, terms) {
+    /**
+     * 给一段文本里的搜索词加 <mark>。
+     * activeRange 是「当前定位到的那一处」在整篇正文里的区间：落在里面的那个 mark 会再加一个
+     * ima-kb-mark-active 类，颜色更重、带一圈脉冲，翻上一处/下一处时一眼能找到。
+     */
+    function highlight(textValue, terms, activeRange) {
       if (!terms || terms.length === 0) return textValue
       const pattern = terms.map(escapeRegExp).join('|')
       if (pattern === '') return textValue
@@ -311,9 +316,28 @@ window.__ModuleLoader__.load({
       } catch {
         return textValue
       }
-      return textValue.split(regex).map((chunk, index) =>
-        index % 2 === 1 ? h('mark', { key: 'mark-' + index, className: 'ima-kb-mark' }, chunk) : chunk,
-      )
+      const nodes = []
+      let last = 0
+      let match = regex.exec(textValue)
+      while (match !== null) {
+        const start = match.index
+        const end = start + match[0].length
+        if (start > last) nodes.push(textValue.slice(last, start))
+        const active = activeRange !== null && activeRange !== undefined
+          && start < activeRange[1] && end > activeRange[0]
+        nodes.push(
+          h(
+            'mark',
+            { key: 'mark-' + start, className: active ? 'ima-kb-mark ima-kb-mark-active' : 'ima-kb-mark' },
+            match[0],
+          ),
+        )
+        last = end
+        if (match[0].length === 0) regex.lastIndex += 1
+        match = regex.exec(textValue)
+      }
+      if (last < textValue.length) nodes.push(textValue.slice(last))
+      return nodes.length > 0 ? nodes : textValue
     }
 
     function formatNumber(value) {
@@ -344,19 +368,32 @@ window.__ModuleLoader__.load({
      * 阅读区正文渲染：把行首的 Markdown 标题（`# ` ~ `#### `）渲染成带样式的标题行，
      * 其余行原样保留（外层 pre-wrap 负责换行），同时保留搜索高亮。
      */
-    function renderReaderBody(content, terms) {
-      const lines = String(content || '').split('\n')
+    function renderReaderBody(content, terms, activeRange) {
+      const text = String(content || '')
+      const lines = text.split('\n')
+      let offset = 0
       return lines.map((line, index) => {
+        const lineStart = offset
+        offset += line.length + 1
         const heading = /^(#{1,4}) +(.+)$/.exec(line)
+        let localRange = null
+        if (activeRange !== null && activeRange !== undefined) {
+          const from = activeRange.start - lineStart
+          const to = activeRange.end - lineStart
+          if (to > 0 && from < line.length) localRange = [Math.max(0, from), Math.min(line.length, to)]
+        }
         if (heading !== null) {
           const level = heading[1].length
+          // 标题行只渲染标题文字，激活区间要扣掉前面的「# 」
+          const prefix = line.length - heading[2].length
+          const shifted = localRange === null ? null : [localRange[0] - prefix, localRange[1] - prefix]
           return h(
             'div',
             { key: 'rh-' + index, className: 'ima-kb-rh ima-kb-rh' + level },
-            highlight(heading[2], terms),
+            highlight(heading[2], terms, shifted),
           )
         }
-        return h('span', { key: 'rl-' + index }, highlight(line, terms), '\n')
+        return h('span', { key: 'rl-' + index }, highlight(line, terms, localRange), '\n')
       })
     }
 
@@ -1559,6 +1596,20 @@ window.__ModuleLoader__.load({
         return found
       }, [doc, query])
 
+      /** 最长那个搜索词的长度：激活区间按「命中点 + 词长」估，够覆盖整处命中。 */
+      const maxTermLength = React.useMemo(
+        () => terms.reduce((max, term) => Math.max(max, term.length), 0),
+        [terms.join('\u0000')],
+      )
+
+      /** 当前「上一处 / 下一处」停在哪：只有它会被加粗高亮。 */
+      const activeHit = React.useMemo(() => {
+        if (docHits.length === 0 || maxTermLength <= 0) return null
+        const at = docHits[Math.min(hitIndex, docHits.length - 1)]
+        if (typeof at !== 'number') return null
+        return { start: at, end: at + maxTermLength }
+      }, [docHits, hitIndex, maxTermLength])
+
       React.useEffect(() => {
         setHitIndex(0)
       }, [doc === null ? null : doc.id, query])
@@ -2347,7 +2398,7 @@ window.__ModuleLoader__.load({
                     h(
                       'div',
                       { className: 'ima-kb-reader', onScroll: onReaderScroll, ref: readerRef },
-                      h('div', { className: 'ima-kb-reader-inner' }, renderReaderBody(doc.content, terms)),
+                      h('div', { className: 'ima-kb-reader-inner' }, renderReaderBody(doc.content, terms, activeHit)),
                       loadingDoc ? h('div', { className: 'ima-kb-hint' }, t.counting) : null,
                     ),
                   ),
@@ -2451,7 +2502,9 @@ window.__ModuleLoader__.load({
       '.ima-kb-linkbtn:hover{color:var(--dsw-alias-brand-primary)}',
       '.ima-kb-empty{flex:1 1 auto;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:8px;color:var(--dsw-alias-label-secondary);font-size:12.5px;padding:24px;text-align:center}',
       '.ima-kb-hint{color:var(--dsw-alias-label-secondary);font-size:12px;padding:6px 10px;line-height:1.6;word-break:break-word}',
-      '.ima-kb-mark{background:transparent;color:var(--dsw-alias-brand-primary);font-weight:600;border-bottom:2px solid var(--dsw-alias-brand-primary)}',
+      '.ima-kb-mark{background:#ffe066;color:#1a1a1a;font-weight:700;border-radius:3px;padding:0 2px;box-shadow:0 0 0 1px rgba(214,140,0,.55);scroll-margin:120px}',
+      '.ima-kb-mark-active{background:#ff7a00;color:#fff;box-shadow:0 0 0 2px rgba(255,122,0,.55);animation:ima-kb-pulse 1s ease-out 1}',
+      '@keyframes ima-kb-pulse{0%{box-shadow:0 0 0 2px rgba(255,122,0,.9)}100%{box-shadow:0 0 0 12px rgba(255,122,0,0)}}',
       '.ima-kb-detail{flex:1 1 auto;min-height:0;overflow:auto;padding:28px 32px;display:flex;flex-direction:column;gap:12px;max-width:860px}',
       '.ima-kb-detail-title{font-size:17px;font-weight:600;line-height:1.45;word-break:break-word}',
       '.ima-kb-detail-meta{display:flex;align-items:center;flex-wrap:wrap;gap:6px;font-size:12px;color:var(--dsw-alias-label-secondary)}',
