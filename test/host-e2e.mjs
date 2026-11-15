@@ -343,6 +343,55 @@ check('boot2 全部有字数', warmRows2.length === rows2.length && warmRows2.ev
 const search2 = await call2('/ima-kb/api/search?q=' + encodeURIComponent(term) + '&limit=5')
 check('boot2 检索立即覆盖全部笔记', search2.body.notesScanned === rows2.length, `${search2.body.notesScanned} vs ${rows2.length}`)
 
+// ── 7b. 缓存放 40 天后仍然全命中（v2.7.3：正文缓存默认永不过期）────────
+//   用户要的是「缓存一次就一直留着，只有手动清空/手动更新才变」：
+//   所以把每条正文和列表的时间戳都改到 40 天前，重启后必须还能全量命中，
+//   而且断网也要能起来（列表刷新失败时退回磁盘里那份）。
+console.log('=== boot 2b（缓存放 40 天 + 断网）===')
+const contentEntry2 = readdirSync(cacheDir).find((name) => name.startsWith('content-'))
+const contentPath2 = contentEntry2 === undefined ? '' : join(cacheDir, contentEntry2)
+if (contentPath2 === '') {
+  check('boot2b 找到正文缓存目录', false, 'content-* 目录不存在')
+} else {
+  const backdate = (file) => {
+    const entry = JSON.parse(readFileSync(file, 'utf8'))
+    entry.at = Date.now() - 40 * 24 * 60 * 60 * 1000
+    writeFileSync(file, JSON.stringify(entry), 'utf8')
+  }
+  for (const name of readdirSync(contentPath2)) {
+    if (name.startsWith('n-') && name.endsWith('.json')) backdate(join(contentPath2, name))
+  }
+  const metaPath = join(contentPath2, 'meta.json')
+  const meta = JSON.parse(readFileSync(metaPath, 'utf8'))
+  if (meta.list && typeof meta.list === 'object') meta.list.at = Date.now() - 40 * 24 * 60 * 60 * 1000
+  writeFileSync(metaPath, JSON.stringify(meta), 'utf8')
+
+  const realFetch2b = globalThis.fetch
+  globalThis.fetch = () => { throw new Error('NETWORK_OFF') }
+  try {
+    const boot2b = makeContext()
+    const mod2b = await import(`${pluginPath.href}?boot=2b`)
+    mod2b.apply(boot2b.ctx, { cacheDir, skillsDir, autoInstallSkills: 'off' })
+    const call2b = makeCaller(boot2b.routes[0])
+    const state2b = await call2b('/ima-kb/api/state')
+    const warm2b = state2b.body && state2b.body.warm ? state2b.body.warm : {}
+    console.log('  boot2b /state warm =', JSON.stringify(warm2b))
+    check('boot2b 断网也能列出笔记', typeof state2b.body.noteCount === 'number' && state2b.body.noteCount > 0, JSON.stringify(state2b.body).slice(0, 120))
+    check('boot2b 40 天前的正文缓存仍然全命中', warm2b.cached === rows2.length && warm2b.listed === rows2.length, `cached=${warm2b.cached} listed=${warm2b.listed} vs ${rows2.length}`)
+    const warmStart2b = Date.now()
+    await call2b('/ima-kb/api/warm')
+    const warmMs2b = Date.now() - warmStart2b
+    console.log(`  boot2b /warm 用时 ${(warmMs2b / 1000).toFixed(1)}s（断网，应接近 0）`)
+    check('boot2b 断网 /warm 不走网络', warmMs2b < 5000, `${warmMs2b}ms`)
+    const noteFile2b = readdirSync(contentPath2).find((name) => name.startsWith('n-'))
+    const noteId2b = noteFile2b === undefined ? '' : noteFile2b.slice(2, -5)
+    const read2b = await call2b(`/ima-kb/api/note?id=${encodeURIComponent(noteId2b)}&start=0&length=2000`)
+    check('boot2b 断网也能读正文', read2b.status === 200 && typeof read2b.body.content === 'string' && read2b.body.content.length > 0, JSON.stringify(read2b.body).slice(0, 120))
+  } finally {
+    globalThis.fetch = realFetch2b
+  }
+}
+
 // ── 8. 随包技能自动安装（v2.2.0）──────────────────────────────────────
 console.log('=== bundled skills ===')
 const skillMarket = join(skillsDir, 'market-research', 'SKILL.md')

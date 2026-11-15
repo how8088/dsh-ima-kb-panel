@@ -104,10 +104,10 @@ export const Config = Schema.object({
     .description('最多收录多少篇笔记；ima 单页上限 20，插件会自动翻页，留大一点免得漏笔记'),
   contentTtlMinutes: Schema.number()
     .step(1)
-    .min(1)
-    .max(10080)
-    .default(10080)
-    .description('磁盘正文缓存最长保留多久（分钟）。是否重取由笔记的 modify_time 决定，不靠这个值'),
+    .min(0)
+    .max(525600)
+    .default(0)
+    .description('磁盘正文缓存最长保留多久（分钟）。**默认 0 = 永不过期**，缓存一直留到你手动清空；填大于 0 才会按时间自动丢弃。是否重取由笔记的 modify_time 决定'),
   cacheDir: Schema.string()
     .default('')
     .description('正文缓存目录；留空用 ~/.dsh/cache/ima-kb-panel，填 - 表示不落盘'),
@@ -223,7 +223,7 @@ const settings = {
   clientIdEnv: 'IMA_CLIENT_ID',
   apiKeyEnv: 'IMA_API_KEY',
   maxNotes: 500,
-  contentTtlMs: 10080 * 60 * 1000,
+  contentTtlMs: 0,
   cacheDir: DEFAULT_CACHE_DIR,
   titleFilter: [],
   skillsDir: '',
@@ -258,7 +258,7 @@ function resolveSettings(raw) {
   settings.clientIdEnv = nonEmptyString(config.clientIdEnv) || 'IMA_CLIENT_ID'
   settings.apiKeyEnv = nonEmptyString(config.apiKeyEnv) || 'IMA_API_KEY'
   settings.maxNotes = clamp(config.maxNotes ?? 500, 1, 500)
-  settings.contentTtlMs = clamp(config.contentTtlMinutes ?? 10080, 1, 10080) * 60 * 1000
+  settings.contentTtlMs = clamp(config.contentTtlMinutes ?? 0, 0, 525600) * 60 * 1000
   const rawCacheDir = nonEmptyString(config.cacheDir)
   settings.cacheDir = rawCacheDir === '-' ? '' : rawCacheDir || DEFAULT_CACHE_DIR
   settings.skillsDir = nonEmptyString(config.skillsDir)
@@ -543,6 +543,16 @@ function freshContent(noteId) {
   return contentCache.get(noteId)
 }
 
+/**
+ * 正文缓存是否按时间过期。
+ * 默认 0 = 永不过期：缓存一直留到用户手动「清空缓存」，重启、换天都不动它。
+ * 只有显式把 contentTtlMinutes 填成大于 0 才会走时间淘汰。
+ * @param {number} at - 这条正文写进缓存的时间戳。
+ */
+function contentExpired(at) {
+  return settings.contentTtlMs > 0 && Date.now() - at >= settings.contentTtlMs
+}
+
 function readDiskMeta(dir) {
   try {
     const payload = JSON.parse(readFileSync(join(dir, 'meta.json'), 'utf8'))
@@ -558,7 +568,8 @@ function restoreNoteList(list) {
   if (list === null || typeof list !== 'object') return
   if (!Array.isArray(list.notes) || list.notes.length === 0) return
   const at = Number(list.at) || 0
-  if (Date.now() - at >= LIST_TTL_MS * 12) return
+  // 不再按年龄丢弃：磁盘里那份列表就是上次的真相，超过一天也只是「该刷新了」，
+  // 由 listNotes() 决定要不要联网刷新，刷新失败还能拿它兜底（断网时列表不会变成空的）。
   notesCache = { at, notes: list.notes, truncated: Boolean(list.truncated) }
 }
 
@@ -581,7 +592,7 @@ function migrateLegacyCache(dir) {
   for (const [noteId, entry] of Object.entries(notes)) {
     if (entry === null || typeof entry !== 'object' || typeof entry.content !== 'string') continue
     const at = Number(entry.at) || 0
-    if (Date.now() - at >= settings.contentTtlMs) continue
+    if (contentExpired(at)) continue
     putContent(noteId, {
       content: entry.content,
       at,
@@ -627,7 +638,7 @@ function ensureDiskLoaded() {
     }
     if (entry === null || typeof entry !== 'object' || typeof entry.content !== 'string') continue
     const at = Number(entry.at) || 0
-    if (Date.now() - at >= settings.contentTtlMs) continue
+    if (contentExpired(at)) continue
     const noteId = name.slice(2, -5)
     putContent(noteId, {
       content: entry.content,
@@ -660,7 +671,7 @@ function writeDiskCache() {
     for (const noteId of dirtyNotes) {
       const entry = contentCache.get(noteId)
       const target = noteFilePath(dir, noteId)
-      if (entry === undefined || Date.now() - entry.at >= settings.contentTtlMs) {
+      if (entry === undefined || contentExpired(entry.at)) {
         try {
           rmSync(target, { force: true })
         } catch {
@@ -697,7 +708,7 @@ function pruneDiskCache() {
     if (!name.startsWith('n-') || !name.endsWith('.json')) continue
     const noteId = name.slice(2, -5)
     const entry = contentCache.get(noteId)
-    if (entry === undefined || Date.now() - entry.at >= settings.contentTtlMs) {
+    if (entry === undefined || contentExpired(entry.at)) {
       try {
         rmSync(join(dir, name), { force: true })
       } catch {
@@ -883,7 +894,13 @@ async function listNotes() {
   if (openNoteList === undefined) {
     openNoteList = fetchAllNotes().finally(() => { openNoteList = undefined })
   }
-  return openNoteList
+  try {
+    return await openNoteList
+  } catch (error) {
+    // 断网 / 限流时别把列表变成空的：磁盘里那份旧的（目录 + 正文都还完整）继续用。
+    if (notesCache !== undefined && notesCache.notes.length > 0) return notesCache.notes
+    throw error
+  }
 }
 
 // ── 笔记正文：取结构化格式再转成可读文本 ────────────────────────────────
@@ -2900,6 +2917,7 @@ function registerRoutes(ctx) {
           notesCacheDir: cacheDirPath(),
           notesCacheFile: cacheFile(),
           cacheBytes: diskBytesOf(cacheDirPath(), cacheFile()),
+          version: SKILL_VERSION,
           warm: warmSnapshot(),
         })
         return

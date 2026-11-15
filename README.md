@@ -21,7 +21,7 @@
 - **按 `modify_time` 增量预热**：缓存里记住每篇的 `modify_time`，没变过就不重取。
 - 实测数据：`get_doc_content` 单篇 0.86s；串行 800ms 节拍 = 1.5s/篇；
   「2 个在飞 + 起步间隔 700ms」= 0.74s/篇，24 次并发零 `code=200001`。
-- `contentTtlMinutes` 语义改为「磁盘正文最长保留期」（默认 7 天），是否重取看 `modify_time`。
+- **正文缓存默认永不过期**（`contentTtlMinutes` 默认 0）：缓存一直留到你手动「清空缓存」；是否重取只看 `modify_time`。
 
 ## 1.4.0 新功能
 
@@ -149,7 +149,7 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
     credentialsDir: 'D:/ima-creds'      # 凭证目录换地方
     titleFilter: '雪球,宏观'             # 只纳入标题含这些词的笔记
     maxNotes: 200
-    contentTtlMinutes: 360
+    contentTtlMinutes: 0     # 0 = 永不过期（默认）；填分钟数才会按时间淘汰
 ```
 
 | 配置项 | 默认 | 作用 |
@@ -159,7 +159,7 @@ Windows 上就是 `C:\Users\<你>\.config\ima\`。**一行一个，不要引号�
 | `clientIdEnv` | `IMA_CLIENT_ID` | client_id 读哪个环境变量 |
 | `apiKeyEnv` | `IMA_API_KEY` | api_key 读哪个环境变量 |
 | `maxNotes` | 500 | 最多收录多少篇（1–500，插件自动翻页） |
-| `contentTtlMinutes` | 10080 | 磁盘正文最长保留期（分钟）；是否重取看 modify_time |
+| `contentTtlMinutes` | `0` | **0 = 永不过期（默认）**，缓存留到手动清空；填分钟数才按时间淘汰。是否重取看 modify_time |
 | `cacheDir` | 空（= `~/.dsh/cache/ima-kb-panel`） | 正文缓存目录，填 `-` 表示不落盘 |
 | `titleFilter` | 空 | 只看标题含这些词的笔记，逗号分隔 |
 | `skillsDir` | 空（= `~/.dsh/skills`） | 随包技能安装到哪 |
