@@ -1220,10 +1220,12 @@ window.__ModuleLoader__.load({
           clearInterval(timer)
           setKbCacheBusy(false)
           loadKbCache()
-          // refresh=1 会重拉知识库列表，这里同步刷新左侧的库名/文件数。
+          // refresh=1 会重拉知识库列表，这里同步刷新左侧的库名/文件数，
+          // 以及当前打开的目录——否则「更新缓存」之后眼前还是旧的那一份。
           loadKbsRef.current()
+          loadDir(selectedKb, dirFolderId, '', false)
         }
-      }, [selectedKb, loadKbCache, t])
+      }, [selectedKb, loadKbCache, loadDir, dirFolderId, t])
 
       const dropKbCache = React.useCallback(async () => {
         try {
