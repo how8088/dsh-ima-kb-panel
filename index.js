@@ -861,7 +861,8 @@ async function fetchAllNotes(priority = 0) {
     if (notes.length >= settings.maxNotes) break
     cursor = String(fetched)
   }
-  const truncated = reachedEnd === false && notes.length >= settings.maxNotes
+  // 没确认到底就算截断：可能是撞了 maxNotes，也可能是翻页撞了 MAX_LIST_PAGES。
+  const truncated = reachedEnd === false
   const capped = notes.slice(0, settings.maxNotes)
   notesCache = { at: Date.now(), notes: capped, truncated }
   openNoteList = undefined
@@ -874,6 +875,8 @@ const LIST_STALE_SERVE_MS = 24 * 60 * 60 * 1000
 let refreshingNotes
 /** 正在进行的「首次列表拉取」，让并发调用共用一次请求链。 */
 let openNoteList
+/** 后台刷新失败后的退避截止时间：断网时别让每次轮询都再打一轮列表请求。 */
+let notesRetryAt = 0
 
 /**
  * 列出（标题过滤后的）全部笔记。
@@ -886,8 +889,10 @@ async function listNotes() {
   const now = Date.now()
   if (notesCache !== undefined && now - notesCache.at < LIST_TTL_MS) return notesCache.notes
   if (notesCache !== undefined && now - notesCache.at < LIST_STALE_SERVE_MS) {
-    if (refreshingNotes === undefined) {
-      refreshingNotes = fetchAllNotes(1).catch(() => {}).finally(() => { refreshingNotes = undefined })
+    if (refreshingNotes === undefined && now >= notesRetryAt) {
+      refreshingNotes = fetchAllNotes(1)
+        .catch(() => { notesRetryAt = Date.now() + 120000 })
+        .finally(() => { refreshingNotes = undefined })
     }
     return notesCache.notes
   }
@@ -1028,6 +1033,9 @@ async function fetchNoteContent(noteId, priority, modified) {
     content = typeof plain?.content === 'string' ? plain.content : ''
   }
   content = reflowFlatText(content.replace(/\r\n?/g, '\n'))
+  // 两路都返回空：多半是这一篇解析失败，或者刚建好还没写内容。
+  // 不能把空串写进缓存 —— 否则 kb_read / 面板会永远显示「笔记是空的」，再也不重取。
+  if (content === '') throw new Error('ima 没有返回这篇笔记的正文（可能是空笔记，或接口临时异常）')
   const entry = {
     content,
     at: Date.now(),
@@ -1106,8 +1114,11 @@ function warmAll() {
       if (recovered > 0) warmState.failed = Math.max(0, warmState.failed - recovered)
       // 顺手清掉「已经不在列表里」的笔记缓存（用户删了笔记 / 重建换了 id），
       // 否则磁盘缓存会一直带着这些孤儿条目。
+      // 列表被 maxNotes / 翻页上限截断时不能清孤儿：超出本次列表的笔记只是「没列出来」，
+      // 不是被删了，清掉等于把已经缓存好的正文永久删除。
       const liveIds = new Set(notes.map((note) => note.id))
-      for (const noteId of Array.from(contentCache.keys())) {
+      const safeToPrune = notesCache === undefined || notesCache.truncated !== true
+      for (const noteId of safeToPrune ? Array.from(contentCache.keys()) : []) {
         if (!liveIds.has(noteId)) {
           contentCache.delete(noteId)
           dirtyNotes.add(noteId)
@@ -1448,10 +1459,11 @@ async function isPersonalKbId(kbId) {
 }
 
 /** 列出一个知识库的某个目录（folderId 空 = 根目录）。 */
-async function listKbDirectory(kbId, folderId, cursor) {
+async function listKbDirectory(kbId, folderId, cursor, force = false) {
   const dirKey = `${kbId}|${folderId}|${cursor}`
   const cached = kbDirCache.get(dirKey)
-  if (cached !== undefined && Date.now() - cached.at < KB_DIR_TTL_MS) {
+  // force：手动「更新缓存」时绕开内存与磁盘快照，真正去 ima 看一遍有没有新文件。
+  if (!force && cached !== undefined && Date.now() - cached.at < KB_DIR_TTL_MS) {
     // 内存命中也要保证落盘：先浏览再点「更新缓存」时，这些目录本来就在内存里，
     // 以前会直接 return 而不写盘，导致快照少一层。
     if (diskKbDir(kbId, folderId, cursor) === undefined && await isPersonalKbId(kbId)) {
@@ -1460,7 +1472,7 @@ async function listKbDirectory(kbId, folderId, cursor) {
     return cached.value
   }
   // 个人知识库：命中本地快照就直接用，不再打接口（订阅/加入的库没有落盘，走不到这里）。
-  const fromDisk = diskKbDir(kbId, folderId, cursor)
+  const fromDisk = force ? undefined : diskKbDir(kbId, folderId, cursor)
   if (fromDisk !== undefined) {
     kbDirCache.set(dirKey, { at: Date.now(), value: fromDisk })
     return fromDisk
@@ -1893,7 +1905,9 @@ function enforceKbCacheCap() {
       let changed = false
       for (const [mediaId, entry] of texts) {
         if (total <= cap) break
-        total -= JSON.stringify(entry).length
+        // 扣的是字节而不是字符数：中文一个字占 3 字节，按 .length 扣会高估释放量，
+        // 结果为了腾出 100MB 可能删掉 300MB 的正文。
+        total -= Buffer.byteLength(JSON.stringify(entry), 'utf8')
         delete kbDisk.texts[mediaId]
         changed = true
       }
@@ -2074,8 +2088,9 @@ function kbPersistAllowed(kbId) {
 }
 
 function saveKbDir(kbId, folderId, cursor, value) {
-  if (!kbPersistAllowed(kbId)) return
+  // 先加载磁盘：kbPersistAllowed 要读 kbDisk.snaps，没加载会误判「没有快照」而跳过写盘。
   ensureKbDiskLoaded()
+  if (!kbPersistAllowed(kbId)) return
   if (kbDisk === null) return
   const folders = kbDisk.dirs[kbId] ?? {}
   folders[kbDirKeyOf(folderId, cursor)] = { at: Date.now(), value }
@@ -2196,7 +2211,7 @@ async function cachePdfFile(mediaId) {
  * 把一个个人知识库整棵缓存下来：先逐层翻页拉目录，再拉 md/docx/txt 正文，最后（可选）存 PDF 原件。
  * 订阅 / 加入的库直接拒绝——它们仍然按原来的方式在线读。
  */
-function warmPersonalKb(kbId) {
+function warmPersonalKb(kbId, refresh = false) {
   if (kbWarmPromise !== undefined) return kbWarmPromise
   const run = (async () => {
     const kbs = await listKnowledgeBases()
@@ -2210,18 +2225,23 @@ function warmPersonalKb(kbId) {
       total: 0, done: 0, failed: 0, folderCount: 0, fileCount: 0, startedAt: Date.now(), finishedAt: 0,
     })
     ensureKbDiskLoaded()
+    // 手动「更新缓存」：正文内存缓存一并作废，保证读到的是 ima 上的当前版本。
+    if (refresh) kbTextCache.clear()
     kbSaveSuppressed += 1
     const folderQueue = ['']
+    /** 这次真正走到的文件夹：refresh 结束后用它清掉已经不在树里的旧目录条目。 */
+    const visitedFolders = new Set()
     const files = []
     let cachedTexts = 0
     let failed = 0
     try {
       while (folderQueue.length > 0) {
         const folderId = folderQueue.shift()
+        visitedFolders.add(folderId)
         let cursor = ''
         for (;;) {
-          const dir = await listKbDirectory(kbId, folderId, cursor)
-          kbWarmState.folderCount += 1
+          const dir = await listKbDirectory(kbId, folderId, cursor, refresh)
+          kbWarmState.folderCount = visitedFolders.size
           for (const item of dir.items) {
             if (item.folder) folderQueue.push(item.mediaId)
             else files.push(item)
@@ -2269,6 +2289,19 @@ function warmPersonalKb(kbId) {
         }
       }
       kbWarmState.failed = failed
+      if (refresh && kbDisk !== null) {
+        // 强制刷新后，ima 里删掉 / 改名 / 挪走的文件夹还会留在磁盘快照里，
+        // 那些条目会让「已缓存 N 个目录」虚高，也读不到正文，所以清掉。
+        const folders = kbDisk.dirs[kbId]
+        if (folders !== undefined && typeof folders === 'object') {
+          // 键是 kbDirKeyOf() 拼的「cursor|folderId」，folderId 在最后一段。
+          for (const key of Object.keys(folders)) {
+            const owner = key.slice(key.lastIndexOf('|') + 1)
+            if (!visitedFolders.has(owner)) delete folders[key]
+          }
+          if (Object.keys(folders).length === 0) delete kbDisk.dirs[kbId]
+        }
+      }
       if (kbDisk !== null) {
         kbDisk.snaps = kbDisk.snaps ?? {}
         kbDisk.snaps[kbId] = {
@@ -2343,7 +2376,7 @@ function kbCacheStatus() {
         for (const entry of Object.values(folders)) {
           if (!kbFresh(entry)) continue
           dirs += 1
-          bytes += JSON.stringify(entry).length
+          bytes += Buffer.byteLength(JSON.stringify(entry), 'utf8')
           const items = entry !== null && typeof entry === 'object' && entry.value !== null && typeof entry.value === 'object' ? entry.value.items : undefined
           if (Array.isArray(items)) {
             for (const item of items) mediaIds.add(item.mediaId)
@@ -2355,7 +2388,7 @@ function kbCacheStatus() {
           const entry = textMap[mediaId]
           if (entry === undefined || !kbFresh(entry)) continue
           texts += 1
-          bytes += JSON.stringify(entry).length
+          bytes += Buffer.byteLength(JSON.stringify(entry), 'utf8')
         }
       }
       for (const mediaId of mediaIds) {
@@ -2786,6 +2819,35 @@ function registerTools(ctx) {
 }
 
 // ── HTTP 接口（面板用） ──────────────────────────────────────────────────
+/**
+ * 把本地缓存文件流式发给浏览器。
+ *
+ * 发送途中文件被淘汰（缓存超上限）或被删掉时 createReadStream 会 emit error，
+ * 没有监听会让这个响应永远挂着、浏览器一直转圈。这里统一收尾：
+ * 还没发响应头就回 500，已经发了就直接断开；浏览器提前关连接也销毁读流。
+ */
+function pipeFile(res, filePath, options) {
+  const stream = createReadStream(filePath, options)
+  let settled = false
+  const finish = () => {
+    if (settled) return
+    settled = true
+    res.off('close', onClose)
+  }
+  const onClose = () => {
+    finish()
+    stream.destroy()
+  }
+  res.on('close', onClose)
+  stream.on('error', () => {
+    finish()
+    if (res.headersSent) res.destroy()
+    else sendJson(res, 500, { error: '本地缓存读取失败' })
+  })
+  stream.on('end', finish)
+  stream.pipe(res)
+}
+
 /** 直接把本地缓存文件发给浏览器；支持 Range，PDF 内嵌查看才能拖进度条。 */
 function serveLocalFile(res, req, filePath, contentType, title, inline) {
   let size = 0
@@ -2814,7 +2876,7 @@ function serveLocalFile(res, req, filePath, contentType, title, inline) {
         headers['content-range'] = 'bytes ' + start + '-' + end + '/' + size
         headers['content-length'] = String(end - start + 1)
         res.writeHead(206, headers)
-        createReadStream(filePath, { start, end }).pipe(res)
+        pipeFile(res, filePath, { start, end })
         return
       }
       res.writeHead(416, { 'content-range': 'bytes */' + size })
@@ -2823,7 +2885,7 @@ function serveLocalFile(res, req, filePath, contentType, title, inline) {
     }
   }
   res.writeHead(200, headers)
-  createReadStream(filePath).pipe(res)
+  pipeFile(res, filePath)
 }
 
 function sendJson(res, status, value) {
@@ -3025,7 +3087,7 @@ function registerRoutes(ctx) {
           if (kbDisk !== null) kbDisk.list = undefined
         }
         try {
-          sendJson(res, 200, await warmPersonalKb(kbId))
+          sendJson(res, 200, await warmPersonalKb(kbId, url.searchParams.get('refresh') === '1'))
         } catch (error) {
           sendJson(res, 200, { error: error instanceof Error ? error.message : String(error) })
         }

@@ -703,6 +703,11 @@ window.__ModuleLoader__.load({
       const docRef = React.useRef(null)
       /** 打开笔记的请求序号：连点两篇时，只认最后一次的响应，避免旧响应覆盖新正文。 */
       const openSeqRef = React.useRef(0)
+      /** 目录 / 文件 / 检索的请求序号：只认最后一次，别让慢响应把新选择盖掉。 */
+      const dirSeqRef = React.useRef(0)
+      const fileSeqRef = React.useRef(0)
+      const kbSearchSeqRef = React.useRef(0)
+      const searchSeqRef = React.useRef(0)
       selectedRef.current = selected
       docRef.current = doc
 
@@ -863,6 +868,9 @@ window.__ModuleLoader__.load({
           const payload = await getJson(
             API + '/note?id=' + encodeURIComponent(current.id) + '&start=' + current.end + '&length=' + WINDOW_CHARS,
           )
+          // 等响应期间可能已经切到别的笔记：只有还停在这一篇时才追加，
+          // 否则会把上一篇的正文糊到新笔记上。
+          if (docRef.current === null || docRef.current.id !== current.id) return
           setDoc({
             id: current.id,
             title: current.title,
@@ -873,9 +881,9 @@ window.__ModuleLoader__.load({
             anchor: current.anchor,
           })
         } catch (error) {
-          setDocError(describeError(error, t))
+          if (docRef.current !== null && docRef.current.id === current.id) setDocError(describeError(error, t))
         } finally {
-          setLoadingDoc(false)
+          if (docRef.current !== null && docRef.current.id === current.id) setLoadingDoc(false)
         }
       }, [loadingDoc])
 
@@ -910,14 +918,18 @@ window.__ModuleLoader__.load({
       const runSearch = React.useCallback(async (value) => {
         const terms = splitTerms(value)
         if (terms.length === 0) {
+          searchSeqRef.current += 1
           setResults(null)
           setSearchError(null)
           return
         }
+        const seq = searchSeqRef.current + 1
+        searchSeqRef.current = seq
         setSearching(true)
         setSearchError(null)
         try {
           const payload = await getJson(API + '/search?q=' + encodeURIComponent(terms.join(' ')) + '&limit=' + SNIPPET_LIMIT)
+          if (searchSeqRef.current !== seq) return
           setResults(payload)
           setSearchPartial(Boolean(payload && payload.warming))
           setSearchMissing(payload && typeof payload.totalNotes === 'number'
@@ -933,11 +945,12 @@ window.__ModuleLoader__.load({
             setFindError(null)
           }
         } catch (error) {
+          if (searchSeqRef.current !== seq) return
           setResults(null)
           setSearchPartial(false)
           setSearchError(describeError(error, t))
         } finally {
-          setSearching(false)
+          if (searchSeqRef.current === seq) setSearching(false)
         }
       }, [runFind])
 
@@ -1108,6 +1121,9 @@ window.__ModuleLoader__.load({
       loadKbsRef.current = loadKbs
 
       const loadDir = React.useCallback(async (kbId, folderId, cursor, append) => {
+        // 切文件夹 / 切知识库时，慢响应的旧目录不能覆盖新目录（追加同理）。
+        const seq = dirSeqRef.current + 1
+        dirSeqRef.current = seq
         const busy = append ? setDirLoadingMore : setDirLoading
         busy(true)
         setDirError(null)
@@ -1116,6 +1132,7 @@ window.__ModuleLoader__.load({
             + '&folder=' + encodeURIComponent(folderId || '')
             + '&cursor=' + encodeURIComponent(cursor || '')
           const payload = await getJson(API + params)
+          if (dirSeqRef.current !== seq) return
           const items = Array.isArray(payload.items) ? payload.items : []
           if (append) {
             setDirItems((current) => (current || []).concat(items))
@@ -1128,10 +1145,11 @@ window.__ModuleLoader__.load({
           setDirIsEnd(Boolean(payload.isEnd))
           setDirNext(payload.nextCursor || '')
         } catch (error) {
+          if (dirSeqRef.current !== seq) return
           if (!append) setDirItems([])
           setDirError(error)
         } finally {
-          busy(false)
+          if (dirSeqRef.current === seq) busy(false)
         }
       }, [])
 
@@ -1161,6 +1179,9 @@ window.__ModuleLoader__.load({
       }, [selectedKb, dirPath, loadDir])
 
       const selectKb = React.useCallback((kbId) => {
+        // 切库：上一个库的在途检索结果一律作废。
+        kbSearchSeqRef.current += 1
+        setKbSearching(false)
         setSelectedKb(kbId)
         writeLocal(KB_KEY, kbId)
         setKbResults(null)
@@ -1216,6 +1237,9 @@ window.__ModuleLoader__.load({
       }, [loadKbCache, loadDir, selectedKb, dirFolderId])
 
       const selectFile = React.useCallback(async (item, folderLabel) => {
+        // 连点两个文件时只认最后一次的响应，否则 A 的正文会显示在 B 上。
+        const seq = fileSeqRef.current + 1
+        fileSeqRef.current = seq
         setFileSel(item)
         setFileInfo(null)
         setFileText(null)
@@ -1226,6 +1250,7 @@ window.__ModuleLoader__.load({
           const payload = await getJson(
             API + '/kb-file?media_id=' + encodeURIComponent(item.mediaId) + '&title=' + encodeURIComponent(item.title || ''),
           )
+          if (fileSeqRef.current !== seq) return
           setFileInfo({
             type: payload.type,
             typeLabel: payload.typeLabel,
@@ -1234,6 +1259,7 @@ window.__ModuleLoader__.load({
             downloadable: Boolean(payload.downloadable),
           })
         } catch {
+          if (fileSeqRef.current !== seq) return
           setFileInfo({ type: item.type, typeLabel: item.typeLabel, downloadable: false })
         }
         // 正文另取：md/docx 由 Host 解成文本，PDF 给它内嵌查看地址。
@@ -1241,11 +1267,13 @@ window.__ModuleLoader__.load({
           const textPayload = await getJson(
             API + '/kb-text?media_id=' + encodeURIComponent(item.mediaId) + '&title=' + encodeURIComponent(item.title || ''),
           )
+          if (fileSeqRef.current !== seq) return
           setFileText(textPayload)
         } catch (error) {
+          if (fileSeqRef.current !== seq) return
           setFileText({ kind: 'error', text: '', chars: 0, truncated: false, inlineUrl: '', error: String((error && error.message) || error) })
         } finally {
-          setFileTextLoading(false)
+          if (fileSeqRef.current === seq) setFileTextLoading(false)
         }
       }, [])
 
@@ -1401,20 +1429,25 @@ window.__ModuleLoader__.load({
       const runKbSearch = React.useCallback(async (value) => {
         const q = String(value || '').trim()
         if (q === '' || selectedKb === '') {
+          kbSearchSeqRef.current += 1
           setKbResults(null)
           setKbSearchError(null)
           return
         }
+        const seq = kbSearchSeqRef.current + 1
+        kbSearchSeqRef.current = seq
         setKbSearching(true)
         setKbSearchError(null)
         try {
           const payload = await getJson(API + '/kb-search?kb=' + encodeURIComponent(selectedKb) + '&q=' + encodeURIComponent(q))
+          if (kbSearchSeqRef.current !== seq) return
           setKbResults(Array.isArray(payload && payload.items) ? payload.items : [])
         } catch (error) {
+          if (kbSearchSeqRef.current !== seq) return
           setKbResults(null)
           setKbSearchError(describeError(error, t))
         } finally {
-          setKbSearching(false)
+          if (kbSearchSeqRef.current === seq) setKbSearching(false)
         }
       }, [selectedKb])
 
@@ -2321,7 +2354,9 @@ window.__ModuleLoader__.load({
                       h(
                         'div',
                         { className: 'ima-kb-docmeta' },
-                        formatNumber(doc.chars) + ' ' + t.charUnit + ' · 0–' + formatNumber(doc.end),
+                        // 从搜索结果中途打开时前缀是真实起点，不是 0。
+                        formatNumber(doc.chars) + ' ' + t.charUnit + ' · '
+                          + formatNumber(doc.start || 0) + '–' + formatNumber(doc.end),
                       ),
                       tocItems.length > 0
                         ? h(
